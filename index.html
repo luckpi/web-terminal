@@ -1,0 +1,892 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Web Terminal</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/css/xterm.css" />
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: #1e1e1e; color: #ddd; font-family: system-ui, -apple-system, sans-serif; overflow: hidden; }
+    body { display: flex; flex-direction: column; }
+    #toolbar { display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: #2d2d2d; border-bottom: 1px solid #444; font-size: 13px; }
+    #tabs { display: flex; gap: 4px; align-items: center; flex: 1; overflow-x: auto; padding: 0 4px; }
+    #tabs::-webkit-scrollbar { height: 4px; }
+    #tabs::-webkit-scrollbar-thumb { background: #555; border-radius: 2px; }
+    .tab { display: flex; align-items: center; gap: 6px; padding: 5px 10px; background: #3c3c3c; border-radius: 4px; cursor: pointer; white-space: nowrap; user-select: none; border: 1px solid transparent; }
+    .tab.active { background: #0e639c; color: #fff; border-color: #1177bb; }
+    .tab .title { font-family: monospace; font-size: 12px; }
+    .tab .close { font-weight: bold; padding: 0 4px; margin-left: 2px; cursor: pointer; border-radius: 3px; font-size: 14px; line-height: 1; }
+    .tab .close:hover { background: #c75450; color: #fff; }
+    .tab-add { display: flex; align-items: center; justify-content: center; padding: 5px 10px; background: #2d2d2d; border: 1px solid #555; border-radius: 4px; color: #9cdcfe; cursor: pointer; font-size: 16px; line-height: 1; user-select: none; min-width: 28px; }
+    .tab-add:hover { background: #3c3c3c; border-color: #9cdcfe; color: #fff; }
+    .toolbar-right { margin-left: auto; display: flex; gap: 6px; }
+    .toolbar-btn { padding: 5px 10px; border: none; border-radius: 4px; background: #3c3c3c; color: #ddd; cursor: pointer; font-size: 13px; }
+    .toolbar-btn:hover { background: #4c4c4c; }
+    .toolbar-btn:disabled { background: #555; color: #999; cursor: not-allowed; }
+    #terminal-area { flex: 1; position: relative; overflow: hidden; }
+    .empty-state { display: none; position: absolute; inset: 0; align-items: center; justify-content: center; z-index: 5; }
+    .empty-state.visible { display: flex; }
+    .empty-state button { font-size: 16px; padding: 10px 20px; }
+    .term-container { position: absolute; top: 8px; left: 8px; right: 8px; bottom: 8px; visibility: hidden; z-index: 0; }
+    .term-container.active { visibility: visible; z-index: 1; }
+    .modal { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); z-index: 100; align-items: center; justify-content: center; }
+    .modal.active { display: flex; }
+    .modal-content { background: #2d2d2d; border: 1px solid #555; border-radius: 6px; padding: 20px; min-width: 340px; max-width: 90vw; max-height: 85vh; overflow-y: auto; color: #ddd; }
+    .modal-content h3 { margin: 0 0 16px; font-size: 16px; }
+    .modal-content .section { margin-bottom: 14px; padding-bottom: 10px; border-bottom: 1px solid #444; }
+    .modal-content .section-title { font-size: 12px; color: #aaa; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.5px; }
+    .modal-content label { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; font-size: 13px; }
+    .modal-content input[type="text"], .modal-content input[type="number"], .modal-content select { background: #1e1e1e; color: #ddd; border: 1px solid #555; border-radius: 4px; padding: 4px; width: 160px; }
+    .modal-content input[type="color"] { background: transparent; border: none; width: 60px; height: 24px; cursor: pointer; }
+    .modal-content input[type="checkbox"] { width: auto; cursor: pointer; }
+    .modal-content .hint { font-size: 11px; color: #999; margin-top: 4px; text-align: right; }
+    .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+    .modal-actions button { padding: 6px 12px; border: none; border-radius: 4px; background: #0e639c; color: #fff; cursor: pointer; font-size: 13px; }
+    .modal-actions button:hover { background: #1177bb; }
+    .modal-actions .secondary { background: #555; }
+    .modal-actions .secondary:hover { background: #666; }
+  </style>
+</head>
+<body>
+  <div id="toolbar">
+    <div id="tabs"></div>
+    <div class="toolbar-right">
+      <button id="close-all-btn" class="toolbar-btn" onclick="closeAllTabs()" data-i18n="closeAll">关闭所有</button>
+      <button id="settings-btn" class="toolbar-btn" onclick="openSettings()" data-i18n="settings">设置</button>
+    </div>
+  </div>
+  <div id="terminal-area">
+    <div id="empty-state" class="empty-state">
+      <button class="toolbar-btn" onclick="newTerminal()" data-i18n="newTerminal">新建终端</button>
+    </div>
+  </div>
+
+  <div id="settings-modal" class="modal">
+    <div class="modal-content">
+      <h3 data-i18n="terminalSettings">终端设置</h3>
+
+      <div class="section">
+        <div class="section-title" data-i18n="general">常规</div>
+        <label><span data-i18n="language">语言</span>
+          <select id="setting-language">
+            <option value="zh">简体中文</option>
+            <option value="en">English</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="section">
+        <div class="section-title" data-i18n="theme">主题</div>
+        <label><span data-i18n="themePreset">主题预设</span>
+          <select id="setting-theme"></select>
+        </label>
+        <label class="color-row"><span data-i18n="background">背景色</span> <input id="setting-bg" type="color"></label>
+        <label class="color-row"><span data-i18n="foreground">前景色</span> <input id="setting-fg" type="color"></label>
+        <label class="color-row"><span data-i18n="cursor">光标颜色</span> <input id="setting-cursor" type="color"></label>
+        <label><span data-i18n="cursorBlink">光标闪烁</span> <input id="setting-cursor-blink" type="checkbox"></label>
+        <label><span data-i18n="cursorStyle">光标样式</span>
+          <select id="setting-cursor-style"></select>
+        </label>
+      </div>
+
+      <div class="section">
+        <div class="section-title" data-i18n="font">字体</div>
+        <label><span data-i18n="fontSize">字体大小</span> <input id="setting-font-size" type="number" min="8" max="64"></label>
+        <label><span data-i18n="fontFamily">字体</span> <input id="setting-font-family" type="text"></label>
+        <label><span data-i18n="fontWeight">字体粗细</span>
+          <select id="setting-font-weight"></select>
+        </label>
+        <label><span data-i18n="lineHeight">行高</span> <input id="setting-line-height" type="number" min="0.5" max="3" step="0.1"></label>
+        <label><span data-i18n="letterSpacing">字间距</span> <input id="setting-letter-spacing" type="number" min="-5" max="20" step="0.5"></label>
+        <label><span data-i18n="tabWidth">Tab 宽度</span> <input id="setting-tab-width" type="number" min="1" max="32"></label>
+        <label><span data-i18n="scrollback">滚动缓冲</span> <input id="setting-scrollback" type="number" min="0" max="100000" step="1000"></label>
+      </div>
+
+      <div class="section">
+        <div class="section-title" data-i18n="input">输入</div>
+        <label><span data-i18n="copyOnSelect">选中即复制</span> <input id="setting-copy-select" type="checkbox"></label>
+        <label><span data-i18n="rightClickPaste">右键粘贴</span> <input id="setting-right-click-paste" type="checkbox"></label>
+        <div class="hint" id="paste-hint" data-i18n="pasteHint">右键粘贴需要 HTTPS 或浏览器剪贴板权限</div>
+      </div>
+
+      <div class="section">
+        <div class="section-title" data-i18n="connection">连接</div>
+        <label><span data-i18n="autoReconnect">自动重连</span> <input id="setting-auto-reconnect" type="checkbox"></label>
+        <label><span data-i18n="reconnectInterval">重连间隔 (ms)</span> <input id="setting-reconnect-interval" type="number" min="500" max="60000" step="500"></label>
+        <label><span data-i18n="keepaliveInterval">保活间隔 (ms)</span> <input id="setting-keepalive-interval" type="number" min="0" max="300000" step="1000"></label>
+      </div>
+
+      <div class="section">
+        <div class="section-title" data-i18n="session">新会话</div>
+        <label><span data-i18n="sessionTerm">终端类型</span>
+          <select id="setting-term">
+            <option value="xterm-256color">xterm-256color</option>
+            <option value="xterm-direct">xterm-direct</option>
+            <option value="xterm">xterm</option>
+            <option value="screen-256color">screen-256color</option>
+            <option value="linux">linux</option>
+          </select>
+        </label>
+        <label><span data-i18n="sessionColorterm">彩色模式</span>
+          <select id="setting-colorterm">
+            <option value="truecolor">truecolor</option>
+            <option value="24bit">24bit</option>
+            <option value="">无</option>
+          </select>
+        </label>
+        <label><span data-i18n="autoFit">自动适应窗口</span> <input id="setting-auto-fit" type="checkbox" onchange="toggleFixedSizeFields()"></label>
+        <div id="fixed-size-fields">
+          <label><span data-i18n="termCols">列数</span> <input id="setting-term-cols" type="number" min="20" max="500" step="1"></label>
+          <label><span data-i18n="termRows">行数</span> <input id="setting-term-rows" type="number" min="5" max="100" step="1"></label>
+        </div>
+        <div class="hint" data-i18n="sessionHint">对已有会话不生效，只影响新建会话</div>
+      </div>
+
+      <div class="modal-actions">
+        <button class="secondary" onclick="resetSettings()" data-i18n="reset">重置</button>
+        <button class="secondary" onclick="closeSettings()" data-i18n="cancel">取消</button>
+        <button onclick="applySettings()" data-i18n="apply">应用</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/lib/xterm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.11.0/lib/addon-fit.min.js"></script>
+  <script>
+    const tabsEl = document.getElementById('tabs');
+    const terminalArea = document.getElementById('terminal-area');
+    const tabs = [];
+    let activeTabId = null;
+
+    const i18n = {
+      zh: {
+        newTerminal: '新建终端',
+        closeTerminal: '关闭终端',
+        closeAll: '关闭所有',
+        settings: '设置',
+        terminalSettings: '终端设置',
+        general: '常规',
+        language: '语言',
+        theme: '主题',
+        themePreset: '主题预设',
+        background: '背景色',
+        foreground: '前景色',
+        cursor: '光标颜色',
+        cursorBlink: '光标闪烁',
+        cursorStyle: '光标样式',
+        block: '块状',
+        bar: '竖线',
+        underline: '下划线',
+        font: '字体',
+        fontSize: '字体大小',
+        fontFamily: '字体',
+        fontWeight: '字体粗细',
+        lineHeight: '行高',
+        letterSpacing: '字间距',
+        tabWidth: 'Tab 宽度',
+        scrollback: '滚动缓冲',
+        input: '输入',
+        copyOnSelect: '选中即复制',
+        rightClickPaste: '右键粘贴',
+        pasteHint: '右键粘贴需要 HTTPS 或浏览器剪贴板权限',
+        connection: '连接',
+        autoReconnect: '自动重连',
+        reconnectInterval: '重连间隔 (ms)',
+        keepaliveInterval: '保活间隔 (ms)',
+        session: '新会话',
+        sessionTerm: '终端类型',
+        sessionColorterm: '彩色模式',
+        autoFit: '自动适应窗口',
+        termCols: '列数',
+        termRows: '行数',
+        sessionHint: '只影响新创建的会话',
+        apply: '应用',
+        cancel: '取消',
+        reset: '重置',
+        custom: '自定义',
+        close: '关闭终端'
+      },
+      en: {
+        newTerminal: 'New Terminal',
+        closeTerminal: 'Close Terminal',
+        closeAll: 'Close All',
+        settings: 'Settings',
+        terminalSettings: 'Terminal Settings',
+        general: 'General',
+        language: 'Language',
+        theme: 'Theme',
+        themePreset: 'Theme preset',
+        background: 'Background',
+        foreground: 'Foreground',
+        cursor: 'Cursor',
+        cursorBlink: 'Cursor blink',
+        cursorStyle: 'Cursor style',
+        block: 'Block',
+        bar: 'Bar',
+        underline: 'Underline',
+        font: 'Font',
+        fontSize: 'Font size',
+        fontFamily: 'Font family',
+        fontWeight: 'Font weight',
+        lineHeight: 'Line height',
+        letterSpacing: 'Letter spacing',
+        tabWidth: 'Tab width',
+        scrollback: 'Scrollback',
+        input: 'Input',
+        copyOnSelect: 'Copy on select',
+        rightClickPaste: 'Right-click paste',
+        pasteHint: 'Right-click paste requires HTTPS or clipboard permission',
+        connection: 'Connection',
+        autoReconnect: 'Auto reconnect',
+        reconnectInterval: 'Reconnect interval (ms)',
+        keepaliveInterval: 'Keepalive interval (ms)',
+        session: 'New session',
+        sessionTerm: 'Terminal type',
+        sessionColorterm: 'Color mode',
+        autoFit: 'Auto fit to window',
+        termCols: 'Columns',
+        termRows: 'Rows',
+        sessionHint: 'Only affects newly created sessions',
+        apply: 'Apply',
+        cancel: 'Cancel',
+        reset: 'Reset',
+        custom: 'Custom',
+        close: 'Close terminal'
+      }
+    };
+
+    function t(key) {
+      const lang = currentSettings.language || 'zh';
+      if (i18n[lang] && i18n[lang][key]) return i18n[lang][key];
+      if (i18n.en && i18n.en[key]) return i18n.en[key];
+      return key;
+    }
+
+    function updateI18n() {
+      document.querySelectorAll('[data-i18n]').forEach(el => {
+        el.textContent = t(el.dataset.i18n);
+      });
+      const settingsBtn = document.getElementById('settings-btn');
+      if (settingsBtn) settingsBtn.textContent = t('settings');
+      if (plusEl) plusEl.title = t('newTerminal');
+      tabs.forEach(tab => {
+        const close = tab.tabEl.querySelector('.close');
+        if (close) close.title = t('close');
+      });
+    }
+
+    const themePresets = {
+      Default: { background: '#1e1e1e', foreground: '#d4d4d4', cursor: '#d4d4d4', selectionBackground: '#264f78' },
+      Dracula: { background: '#282a36', foreground: '#f8f8f2', cursor: '#f8f8f2', selectionBackground: '#44475a' },
+      'Solarized Dark': { background: '#002b36', foreground: '#839496', cursor: '#93a1a1', selectionBackground: '#073642' },
+      'Solarized Light': { background: '#fdf6e3', foreground: '#657b83', cursor: '#586e75', selectionBackground: '#eee8d5' },
+      'One Dark': { background: '#282c34', foreground: '#abb2bf', cursor: '#abb2bf', selectionBackground: '#3e4451' },
+      Monokai: { background: '#272822', foreground: '#f8f8f2', cursor: '#f8f8f2', selectionBackground: '#49483e' }
+    };
+
+    const defaultLanguage = (navigator.language || 'zh').toLowerCase().startsWith('zh') ? 'zh' : 'en';
+
+    const defaultSettings = {
+      language: defaultLanguage,
+      theme: 'Default',
+      fontSize: 14,
+      fontFamily: 'Menlo, Monaco, "Courier New", monospace, Consolas, "Liberation Mono"',
+      fontWeight: 'normal',
+      lineHeight: 1,
+      letterSpacing: 0,
+      tabStopWidth: 8,
+      background: '#1e1e1e',
+      foreground: '#d4d4d4',
+      cursor: '#d4d4d4',
+      selectionBackground: '#264f78',
+      cursorStyle: 'block',
+      cursorBlink: true,
+      scrollback: 10000,
+      copyOnSelect: true,
+      rightClickPaste: false,
+      autoReconnect: true,
+      reconnectInterval: 3000,
+      keepaliveInterval: 30000,
+      term: 'xterm-256color',
+      colorterm: 'truecolor',
+      autoFit: true,
+      termCols: 80,
+      termRows: 24
+    };
+
+    function loadSettings() {
+      try {
+        const saved = JSON.parse(localStorage.getItem('webterm-settings'));
+        if (saved) return { ...defaultSettings, ...saved };
+      } catch (e) {}
+      return { ...defaultSettings };
+    }
+
+    let currentSettings = loadSettings();
+
+    function saveSettings() {
+      localStorage.setItem('webterm-settings', JSON.stringify(currentSettings));
+    }
+
+    function getThemeObject() {
+      return {
+        background: currentSettings.background,
+        foreground: currentSettings.foreground,
+        cursor: currentSettings.cursor,
+        selectionBackground: currentSettings.selectionBackground
+      };
+    }
+
+    function getTerminalOptions() {
+      const cols = parseInt(currentSettings.termCols, 10) || 80;
+      const rows = parseInt(currentSettings.termRows, 10) || 24;
+      const opts = {
+        fontSize: currentSettings.fontSize,
+        fontFamily: currentSettings.fontFamily,
+        fontWeight: currentSettings.fontWeight,
+        lineHeight: currentSettings.lineHeight,
+        letterSpacing: currentSettings.letterSpacing,
+        tabStopWidth: currentSettings.tabStopWidth,
+        theme: getThemeObject(),
+        scrollback: currentSettings.scrollback
+      };
+      if (!currentSettings.autoFit) {
+        if (cols > 0) opts.cols = cols;
+        if (rows > 0) opts.rows = rows;
+      }
+      return opts;
+    }
+
+    function applyTerminalSettings() {
+      tabs.forEach(t => {
+        const opts = t.term.options;
+        opts.cursorBlink = currentSettings.cursorBlink;
+        opts.fontSize = currentSettings.fontSize;
+        opts.fontFamily = currentSettings.fontFamily;
+        opts.fontWeight = currentSettings.fontWeight;
+        opts.lineHeight = currentSettings.lineHeight;
+        opts.letterSpacing = currentSettings.letterSpacing;
+        opts.tabStopWidth = currentSettings.tabStopWidth;
+        opts.theme = getThemeObject();
+        opts.cursorStyle = currentSettings.cursorStyle;
+        opts.scrollback = currentSettings.scrollback;
+      });
+      tabs.forEach(t => {
+        if (t.id === activeTabId) applyTabSize(t);
+      });
+      tabs.forEach(t => {
+        try { t.term.refresh(0, t.term.rows - 1); } catch (e) {}
+      });
+      const active = tabs.find(t => t.id === activeTabId);
+      if (active) {
+        active.term.focus();
+      }
+    }
+
+    function applyTabSize(tab) {
+      if (!tab || !tab.term) return;
+      if (currentSettings.autoFit) {
+        try { tab.fitAddon.fit(); } catch (e) {}
+      } else {
+        const cols = parseInt(currentSettings.termCols, 10) || 80;
+        const rows = parseInt(currentSettings.termRows, 10) || 24;
+        if (tab.term.cols === cols && tab.term.rows === rows) return;
+        try { tab.term.resize(cols, rows); } catch (e) {}
+      }
+    }
+
+    function setupKeepalive(tab) {
+      if (tab.keepaliveTimer) clearInterval(tab.keepaliveTimer);
+      tab.keepaliveTimer = null;
+      if (currentSettings.keepaliveInterval > 0) {
+        tab.keepaliveTimer = setInterval(() => {
+          if (tab.ws && tab.ws.readyState === WebSocket.OPEN) {
+            tab.ws.send(JSON.stringify({ type: 'ping' }));
+          }
+        }, currentSettings.keepaliveInterval);
+      }
+    }
+
+    function applyConnectionSettings() {
+      tabs.forEach(t => setupKeepalive(t));
+    }
+
+    function copyToClipboard(text) {
+      if (!text) return;
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).catch(err => console.warn('copy failed', err));
+      } else {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.left = '-9999px';
+        ta.setAttribute('readonly', '');
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        try {
+          document.execCommand('copy');
+        } catch (e) {}
+        document.body.removeChild(ta);
+      }
+    }
+
+    async function pasteFromClipboard() {
+      if (navigator.clipboard && window.isSecureContext) {
+        try {
+          const text = await navigator.clipboard.readText();
+          if (text) {
+            const tab = tabs.find(t => t.id === activeTabId);
+            if (tab && tab.ws && tab.ws.readyState === WebSocket.OPEN) {
+              tab.ws.send(JSON.stringify({ type: 'input', data: text }));
+            }
+          }
+        } catch (e) {
+          console.warn('paste failed', e);
+        }
+      } else {
+        console.warn('right-click paste requires HTTPS or clipboard permission');
+      }
+    }
+
+    const plusEl = document.createElement('div');
+    plusEl.className = 'tab-add';
+    plusEl.title = t('newTerminal');
+    plusEl.textContent = '+';
+    plusEl.onclick = (e) => {
+      e.stopPropagation();
+      newTerminal();
+    };
+    tabsEl.appendChild(plusEl);
+
+    function genSessionId() {
+      const b = new Uint8Array(12);
+      crypto.getRandomValues(b);
+      return Array.from(b, x => x.toString(16).padStart(2, '0')).join('');
+    }
+
+    function getQuerySession() {
+      const m = /[?&]session=([^&]+)/.exec(location.search);
+      return m ? decodeURIComponent(m[1]) : null;
+    }
+
+    function getWsUrl(sessionId) {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const term = encodeURIComponent(currentSettings.term || 'xterm-256color');
+      const colorterm = currentSettings.colorterm ? encodeURIComponent(currentSettings.colorterm) : '';
+      const rows = parseInt(currentSettings.termRows, 10) || 24;
+      const cols = parseInt(currentSettings.termCols, 10) || 80;
+      return `${proto}//${location.host}/ws?session=${encodeURIComponent(sessionId)}&term=${term}&colorterm=${colorterm}&rows=${rows}&cols=${cols}`;
+    }
+
+    function updateUrl(sessionId) {
+      if (!sessionId) return;
+      history.replaceState({}, '', '?session=' + encodeURIComponent(sessionId));
+    }
+
+    function newTerminal() {
+      const sid = genSessionId();
+      createTab(sid, true);
+    }
+
+    function updateEmptyState() {
+      const empty = document.getElementById('empty-state');
+      if (!empty) return;
+      empty.classList.toggle('visible', tabs.length === 0);
+    }
+
+    function reconnectTab(tab) {
+      if (tab.reconnectTimer) {
+        clearTimeout(tab.reconnectTimer);
+        tab.reconnectTimer = null;
+      }
+      if (tab.ws) {
+        try { tab.ws.onclose = null; } catch (e) {}
+        try { tab.ws.onerror = null; } catch (e) {}
+        try { tab.ws.onopen = null; } catch (e) {}
+        try { tab.ws.onmessage = null; } catch (e) {}
+        try { tab.ws.close(); } catch (e) {}
+      }
+      const ws = new WebSocket(getWsUrl(tab.id));
+      ws.binaryType = 'arraybuffer';
+      tab.ws = ws;
+      tab.initialSync = true;
+      tab.intentionalClose = false;
+
+      ws.onopen = () => {
+        if (tab.tabEl && tab.tabEl.isConnected) tab.tabEl.style.opacity = '1';
+        if (tab.id === activeTabId) {
+          applyTabSize(tab);
+          tab.term.focus();
+        }
+      };
+
+      ws.onmessage = (e) => {
+        if (typeof e.data === 'string') return;
+        if (tab.initialSync) {
+          // In-band RIS (Reset to Initial State) instead of term.reset().
+          // This clears the buffer and resets the parser synchronously with
+          // the incoming data, avoiding the race that can display xterm
+          // device-attributes replies like "1;2c" / "1R" as plain text.
+          tab.term.write('\x1bc');
+          tab.initialSync = false;
+        }
+        tab.term.write(new Uint8Array(e.data));
+      };
+
+      ws.onclose = () => {
+        if (tab.tabEl && tab.tabEl.isConnected) tab.tabEl.style.opacity = '0.6';
+        if (tab.intentionalClose) return;
+        if (tab.reconnectTimer) clearTimeout(tab.reconnectTimer);
+        if (currentSettings.autoReconnect && currentSettings.reconnectInterval > 0) {
+          tab.reconnectTimer = setTimeout(() => reconnectTab(tab), currentSettings.reconnectInterval);
+        }
+      };
+
+      ws.onerror = () => {
+        if (tab.tabEl && tab.tabEl.isConnected) tab.tabEl.style.opacity = '0.6';
+      };
+
+      setupKeepalive(tab);
+    }
+
+    function createTab(sessionId, active = false) {
+      const existing = tabs.find(t => t.id === sessionId);
+      if (existing) {
+        if (active) switchTab(sessionId);
+        return existing;
+      }
+
+      const tabEl = document.createElement('div');
+      tabEl.className = 'tab' + (active ? ' active' : '');
+      tabEl.innerHTML = `<span class="title">${sessionId.slice(0, 8)}</span><span class="close" title="${t('close')}">×</span>`;
+      tabEl.onclick = (e) => {
+        if (e.target.classList.contains('close')) {
+          closeTab(sessionId);
+        } else {
+          switchTab(sessionId);
+        }
+      };
+      tabsEl.insertBefore(tabEl, plusEl);
+
+      const container = document.createElement('div');
+      container.className = 'term-container' + (active ? ' active' : '');
+      terminalArea.appendChild(container);
+
+      const term = new Terminal(getTerminalOptions());
+      const fitAddon = new FitAddon.FitAddon();
+      term.loadAddon(fitAddon);
+      term.open(container);
+      // Set cursor options only after the terminal is attached to the DOM
+      // to work around xterm.js not picking them up from the constructor.
+      term.options.cursorBlink = currentSettings.cursorBlink;
+      term.options.cursorStyle = currentSettings.cursorStyle;
+
+      term.onData((data) => {
+        const tab = tabs.find(t => t.id === sessionId);
+        if (tab && tab.ws && tab.ws.readyState === WebSocket.OPEN) {
+          tab.ws.send(JSON.stringify({ type: 'input', data }));
+        }
+      });
+
+      term.onResize(({ cols, rows }) => {
+        const tab = tabs.find(t => t.id === sessionId);
+        if (tab && tab.ws && tab.ws.readyState === WebSocket.OPEN) {
+          tab.ws.send(JSON.stringify({ type: 'resize', cols, rows }));
+        }
+      });
+
+      term.onSelectionChange(() => {
+        if (!currentSettings.copyOnSelect) return;
+        const text = term.getSelection();
+        if (text) copyToClipboard(text);
+      });
+
+      term.element.addEventListener('contextmenu', (e) => {
+        if (!currentSettings.rightClickPaste) return;
+        if (!navigator.clipboard || !window.isSecureContext) return;
+        e.preventDefault();
+        pasteFromClipboard();
+      });
+
+      const tab = { id: sessionId, sessionId, tabEl, container, term, fitAddon, ws: null, initialSync: true, intentionalClose: false };
+      tabs.push(tab);
+
+      if (active) {
+        reconnectTab(tab);
+        switchTab(sessionId);
+      }
+
+      updateEmptyState();
+      return tab;
+    }
+
+    function switchTab(sessionId) {
+      for (const t of tabs) {
+        const isActive = t.id === sessionId;
+        t.tabEl.classList.toggle('active', isActive);
+        t.container.classList.toggle('active', isActive);
+      }
+      activeTabId = sessionId;
+      const tab = tabs.find(t => t.id === sessionId);
+      if (tab) {
+        if (!tab.ws) {
+          reconnectTab(tab);
+        } else if (tab.ws.readyState === WebSocket.OPEN) {
+          applyTabSize(tab);
+        }
+        tab.term.focus();
+      }
+      updateUrl(sessionId);
+    }
+
+    function closeTab(sessionId) {
+      const idx = tabs.findIndex(t => t.id === sessionId);
+      if (idx === -1) return;
+      const tab = tabs[idx];
+
+      tab.intentionalClose = true;
+      if (tab.keepaliveTimer) clearInterval(tab.keepaliveTimer);
+      if (tab.reconnectTimer) clearTimeout(tab.reconnectTimer);
+      if (tab.ws && tab.ws.readyState === WebSocket.OPEN) {
+        tab.ws.send(JSON.stringify({ type: 'close' }));
+        tab.ws.close();
+      }
+      tab.term.dispose();
+      tab.tabEl.remove();
+      tab.container.remove();
+      tabs.splice(idx, 1);
+
+      if (activeTabId === sessionId) {
+        if (tabs.length) {
+          switchTab(tabs[0].id);
+        } else {
+          activeTabId = null;
+          history.replaceState({}, '', location.pathname);
+        }
+      }
+      updateEmptyState();
+    }
+
+    function closeAllTabs() {
+      if (!tabs.length) return;
+      activeTabId = null;
+      history.replaceState({}, '', location.pathname);
+      // Close from the end to keep array index simple
+      for (let i = tabs.length - 1; i >= 0; i--) {
+        closeTab(tabs[i].id);
+      }
+      updateEmptyState();
+    }
+
+    window.addEventListener('resize', () => {
+      if (activeTabId && currentSettings.autoFit) {
+        const tab = tabs.find(t => t.id === activeTabId);
+        applyTabSize(tab);
+      }
+    });
+
+    window.addEventListener('beforeunload', () => {
+      // Closing the browser page/tab must NOT kill the backend PTYs.
+      tabs.forEach(t => {
+        t.intentionalClose = true;
+        if (t.keepaliveTimer) clearInterval(t.keepaliveTimer);
+        if (t.reconnectTimer) clearTimeout(t.reconnectTimer);
+        if (t.ws) t.ws.close();
+      });
+    });
+
+    function toggleColorRows(show) {
+      document.querySelectorAll('.color-row').forEach(el => {
+        el.style.display = show ? '' : 'none';
+      });
+    }
+
+    function populateThemeSelect() {
+      const sel = document.getElementById('setting-theme');
+      sel.innerHTML = '';
+      Object.keys(themePresets).forEach(name => {
+        const opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = name;
+        sel.appendChild(opt);
+      });
+      const custom = document.createElement('option');
+      custom.value = 'Custom';
+      custom.textContent = t('custom');
+      sel.appendChild(custom);
+
+      sel.onchange = () => {
+        const name = sel.value;
+        if (themePresets[name]) {
+          const p = themePresets[name];
+          document.getElementById('setting-bg').value = p.background;
+          document.getElementById('setting-fg').value = p.foreground;
+          document.getElementById('setting-cursor').value = p.cursor;
+        }
+        toggleColorRows(name === 'Custom');
+      };
+
+      ['setting-bg', 'setting-fg', 'setting-cursor'].forEach(id => {
+        document.getElementById(id).oninput = () => {
+          sel.value = 'Custom';
+          toggleColorRows(true);
+        };
+      });
+    }
+
+    function populateSelects() {
+      populateThemeSelect();
+
+      const styleSel = document.getElementById('setting-cursor-style');
+      styleSel.innerHTML = '';
+      ['block', 'bar', 'underline'].forEach(k => {
+        const opt = document.createElement('option');
+        opt.value = k;
+        opt.textContent = t(k);
+        styleSel.appendChild(opt);
+      });
+
+      const weightSel = document.getElementById('setting-font-weight');
+      weightSel.innerHTML = '';
+      ['normal', 'bold', '100', '200', '300', '400', '500', '600', '700', '800', '900'].forEach(k => {
+        const opt = document.createElement('option');
+        opt.value = k;
+        opt.textContent = k;
+        weightSel.appendChild(opt);
+      });
+    }
+
+    function toggleFixedSizeFields() {
+      const autoFit = document.getElementById('setting-auto-fit').checked;
+      const fixed = document.getElementById('fixed-size-fields');
+      if (fixed) fixed.style.display = autoFit ? 'none' : '';
+    }
+
+    function openSettings() {
+      populateSelects();
+      document.getElementById('setting-language').value = currentSettings.language;
+
+      const themeSel = document.getElementById('setting-theme');
+      themeSel.value = currentSettings.theme || 'Custom';
+      if (!themeSel.value) themeSel.value = 'Custom';
+
+      document.getElementById('setting-bg').value = currentSettings.background;
+      document.getElementById('setting-fg').value = currentSettings.foreground;
+      document.getElementById('setting-cursor').value = currentSettings.cursor;
+      toggleColorRows(themeSel.value === 'Custom');
+      document.getElementById('setting-cursor-blink').checked = currentSettings.cursorBlink;
+      document.getElementById('setting-cursor-style').value = currentSettings.cursorStyle;
+      document.getElementById('setting-font-size').value = currentSettings.fontSize;
+      document.getElementById('setting-font-family').value = currentSettings.fontFamily;
+      document.getElementById('setting-font-weight').value = currentSettings.fontWeight;
+      document.getElementById('setting-line-height').value = currentSettings.lineHeight;
+      document.getElementById('setting-letter-spacing').value = currentSettings.letterSpacing;
+      document.getElementById('setting-tab-width').value = currentSettings.tabStopWidth;
+      document.getElementById('setting-scrollback').value = currentSettings.scrollback;
+      document.getElementById('setting-copy-select').checked = currentSettings.copyOnSelect;
+      document.getElementById('setting-right-click-paste').checked = currentSettings.rightClickPaste;
+      document.getElementById('setting-auto-reconnect').checked = currentSettings.autoReconnect;
+      document.getElementById('setting-reconnect-interval').value = currentSettings.reconnectInterval;
+      document.getElementById('setting-keepalive-interval').value = currentSettings.keepaliveInterval;
+      document.getElementById('setting-term').value = currentSettings.term;
+      document.getElementById('setting-colorterm').value = currentSettings.colorterm;
+      document.getElementById('setting-auto-fit').checked = currentSettings.autoFit;
+      toggleFixedSizeFields();
+      document.getElementById('setting-term-cols').value = currentSettings.termCols;
+      document.getElementById('setting-term-rows').value = currentSettings.termRows;
+      document.getElementById('settings-modal').classList.add('active');
+    }
+
+    function closeSettings() {
+      document.getElementById('settings-modal').classList.remove('active');
+    }
+
+    function applySettings() {
+      const newLang = document.getElementById('setting-language').value;
+      const themeSel = document.getElementById('setting-theme');
+      const themeName = themeSel.value;
+      currentSettings.language = newLang;
+      currentSettings.theme = themeName;
+
+      const pickedTheme = themePresets[themeName];
+      if (pickedTheme) {
+        currentSettings.background = pickedTheme.background;
+        currentSettings.foreground = pickedTheme.foreground;
+        currentSettings.cursor = pickedTheme.cursor;
+        currentSettings.selectionBackground = pickedTheme.selectionBackground;
+      } else {
+        currentSettings.background = document.getElementById('setting-bg').value;
+        currentSettings.foreground = document.getElementById('setting-fg').value;
+        currentSettings.cursor = document.getElementById('setting-cursor').value;
+      }
+
+      currentSettings.cursorBlink = document.getElementById('setting-cursor-blink').checked;
+      currentSettings.cursorStyle = document.getElementById('setting-cursor-style').value;
+      currentSettings.fontSize = parseInt(document.getElementById('setting-font-size').value, 10) || defaultSettings.fontSize;
+      currentSettings.fontFamily = document.getElementById('setting-font-family').value || defaultSettings.fontFamily;
+      currentSettings.fontWeight = document.getElementById('setting-font-weight').value;
+      currentSettings.lineHeight = parseFloat(document.getElementById('setting-line-height').value) || defaultSettings.lineHeight;
+      currentSettings.letterSpacing = parseFloat(document.getElementById('setting-letter-spacing').value) || defaultSettings.letterSpacing;
+      currentSettings.tabStopWidth = parseInt(document.getElementById('setting-tab-width').value, 10) || defaultSettings.tabStopWidth;
+      currentSettings.scrollback = parseInt(document.getElementById('setting-scrollback').value, 10);
+      if (isNaN(currentSettings.scrollback)) currentSettings.scrollback = defaultSettings.scrollback;
+
+      currentSettings.copyOnSelect = document.getElementById('setting-copy-select').checked;
+      currentSettings.rightClickPaste = document.getElementById('setting-right-click-paste').checked;
+      currentSettings.autoReconnect = document.getElementById('setting-auto-reconnect').checked;
+      currentSettings.reconnectInterval = parseInt(document.getElementById('setting-reconnect-interval').value, 10) || defaultSettings.reconnectInterval;
+      currentSettings.keepaliveInterval = parseInt(document.getElementById('setting-keepalive-interval').value, 10);
+      if (isNaN(currentSettings.keepaliveInterval)) currentSettings.keepaliveInterval = defaultSettings.keepaliveInterval;
+
+      currentSettings.term = document.getElementById('setting-term').value;
+      currentSettings.colorterm = document.getElementById('setting-colorterm').value;
+      currentSettings.autoFit = document.getElementById('setting-auto-fit').checked;
+      currentSettings.termCols = parseInt(document.getElementById('setting-term-cols').value, 10) || defaultSettings.termCols;
+      currentSettings.termRows = parseInt(document.getElementById('setting-term-rows').value, 10) || defaultSettings.termRows;
+
+      saveSettings();
+      updateI18n();
+      applyTerminalSettings();
+      applyConnectionSettings();
+      closeSettings();
+    }
+
+    function resetSettings() {
+      currentSettings = { ...defaultSettings };
+      saveSettings();
+      updateI18n();
+      applyTerminalSettings();
+      applyConnectionSettings();
+      openSettings();
+    }
+
+    async function init() {
+      try {
+        const sessList = await fetch('/api/sessions').then(r => r.json());
+        const querySid = getQuerySession();
+
+        if (querySid && !sessList.find(s => s.id === querySid)) {
+          sessList.push({ id: querySid });
+        }
+
+        const initialSid = querySid || (sessList[0] && sessList[0].id);
+        sessList.forEach(s => createTab(s.id, s.id === initialSid));
+
+        if (!activeTabId && tabs.length) {
+          switchTab(tabs[0].id);
+        }
+
+        updateI18n();
+      } catch (e) {
+        console.error('init failed', e);
+        updateI18n();
+      }
+      updateEmptyState();
+    }
+
+    init();
+  </script>
+</body>
+</html>
