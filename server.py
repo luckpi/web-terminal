@@ -21,10 +21,10 @@ import tornado.websocket
 from tornado.ioloop import IOLoop
 from ptyprocess import PtyProcess
 
-PORT = int(os.environ.get("PORT", 8765))
+PORT = int(os.environ.get("PORT", "8765"))
 HOST = os.environ.get("HOST", "127.0.0.1")
 SHELL = os.environ.get("SHELL", "/bin/bash")
-# Default working directory for new sessions.  Defaults to the user's home
+# Default working directory for new sessions.  Defaults to the user home
 # directory. Override with the CWD environment variable.
 CWD = os.environ.get("CWD") or os.path.expanduser("~")
 # Terminal type advertised to child shells. xterm-256color enables 256-color
@@ -35,6 +35,11 @@ COLORTERM = os.environ.get("WEB_TERMINAL_COLORTERM", "truecolor")
 TERMINAL_ROWS = int(os.environ.get("TERMINAL_ROWS", "24"))
 TERMINAL_COLS = int(os.environ.get("TERMINAL_COLS", "80"))
 MAX_BUFFER_BYTES = int(os.environ.get("MAX_BUFFER", "100000"))
+# Optional access token. If set, every endpoint (HTTP and WebSocket) requires
+# a matching token in the query string or in the X-Token header.
+TOKEN = os.environ.get("TOKEN", "")
+# Maximum number of active sessions. 0 means unlimited.
+MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "0"))
 
 # session_id -> Session
 sessions = {}
@@ -42,6 +47,16 @@ sessions = {}
 
 def make_session_id():
     return base64.urlsafe_b64encode(os.urandom(12)).decode("ascii").rstrip("=")
+
+
+def _check_token(handler):
+    """Validate the request token when TOKEN is configured."""
+    if not TOKEN:
+        return True
+    token = handler.get_argument("token", default=None)
+    if not token:
+        token = handler.request.headers.get("X-Token")
+    return token == TOKEN
 
 
 def _preexec_setup_pty():
@@ -182,12 +197,28 @@ class Session:
 class TerminalWSHandler(tornado.websocket.WebSocketHandler):
     session = None
 
-    def open(self):
+    async def open(self):
+        if not _check_token(self):
+            try:
+                await self.write_message(json.dumps({"type": "error", "message": "invalid or missing token"}), binary=False)
+            except Exception:
+                pass
+            self.close()
+            return
+
         sid = self.get_argument("session", default=None)
         if not sid:
             sid = make_session_id()
 
         if sid not in sessions:
+            if MAX_SESSIONS and len(sessions) >= MAX_SESSIONS:
+                try:
+                    await self.write_message(json.dumps({"type": "error", "message": "max sessions reached"}), binary=False)
+                except Exception:
+                    pass
+                self.close()
+                return
+
             term = self.get_argument("term", default=TERM)
             colorterm = self.get_argument("colorterm", default=COLORTERM)
             try:
@@ -221,6 +252,11 @@ class TerminalWSHandler(tornado.websocket.WebSocketHandler):
         elif mtype == "close":
             self.session.close()
             self.session = None
+        elif mtype == "ping":
+            try:
+                self.write_message(json.dumps({"type": "pong"}), binary=False)
+            except Exception:
+                pass
 
     def on_close(self):
         if self.session:
@@ -249,7 +285,16 @@ class TerminalWSHandler(tornado.websocket.WebSocketHandler):
 
 class MainHandler(tornado.web.RequestHandler):
     def get(self):
+        if not _check_token(self):
+            self.set_status(403)
+            self.set_header("Content-Type", "application/json")
+            self.finish(json.dumps({"error": "invalid or missing token"}))
+            return
+
         self.set_header("Content-Type", "text/html")
+        self.set_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.set_header("Pragma", "no-cache")
+        self.set_header("Expires", "0")
         html_path = os.path.join(os.path.dirname(__file__), "index.html")
         with open(html_path, "rb") as f:
             self.write(f.read())
@@ -259,6 +304,12 @@ class ApiSessionsHandler(tornado.web.RequestHandler):
     """Return the list of currently active sessions."""
 
     def get(self):
+        if not _check_token(self):
+            self.set_status(403)
+            self.set_header("Content-Type", "application/json")
+            self.finish(json.dumps({"error": "invalid or missing token"}))
+            return
+
         self.set_header("Content-Type", "application/json")
         items = [
             {
@@ -275,6 +326,12 @@ class ApiSessionHandler(tornado.web.RequestHandler):
     """Close a specific session by ID."""
 
     def delete(self, session_id):
+        if not _check_token(self):
+            self.set_status(403)
+            self.set_header("Content-Type", "application/json")
+            self.finish(json.dumps({"error": "invalid or missing token"}))
+            return
+
         session = sessions.get(session_id)
         if not session:
             self.set_status(404)

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Web Terminal</title>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/css/xterm.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/css/xterm.css" integrity="sha384-n2n7twoohnW+d3myBKaUgl7DSiwidw6MkQy9oesGzkPpMjejKRR3XlnD+5yCdtBD" crossorigin="anonymous" />
   <style>
     * { box-sizing: border-box; }
     html, body { margin: 0; height: 100%; background: #1e1e1e; color: #ddd; font-family: system-ui, -apple-system, sans-serif; overflow: hidden; }
@@ -151,8 +151,8 @@
     </div>
   </div>
 
-  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/lib/xterm.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.11.0/lib/addon-fit.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/lib/xterm.min.js" integrity="sha384-pELe6ZHtFxFcuYBq3gMkqvmnNIqUWnAYjBG5gThqQQCjWp8PJ/65MLK4lMIfEK1e" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.11.0/lib/addon-fit.min.js" integrity="sha384-UwMkGaBqfOcrTjPjXdAPWrGQkhpxTJ21vKtTwLb6wBpBM8HQXKAiUuwVJfgY0Yw6" crossorigin="anonymous"></script>
   <script>
     const tabsEl = document.getElementById('tabs');
     const terminalArea = document.getElementById('terminal-area');
@@ -371,11 +371,7 @@
         opts.theme = getThemeObject();
         opts.cursorStyle = currentSettings.cursorStyle;
         opts.scrollback = currentSettings.scrollback;
-      });
-      tabs.forEach(t => {
         if (t.id === activeTabId) applyTabSize(t);
-      });
-      tabs.forEach(t => {
         try { t.term.refresh(0, t.term.rows - 1); } catch (e) {}
       });
       const active = tabs.find(t => t.id === activeTabId);
@@ -471,18 +467,41 @@
       return m ? decodeURIComponent(m[1]) : null;
     }
 
+    function getToken() {
+      const m = /[?&]token=([^&]+)/.exec(location.search);
+      return m ? decodeURIComponent(m[1]) : null;
+    }
+
+    function appendToken(url) {
+      const token = getToken();
+      if (!token) return url;
+      const sep = url.includes('?') ? '&' : '?';
+      return `${url}${sep}token=${encodeURIComponent(token)}`;
+    }
+
+    function debounce(fn, wait) {
+      let timer = null;
+      return (...args) => {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => fn(...args), wait);
+      };
+    }
+
     function getWsUrl(sessionId) {
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       const term = encodeURIComponent(currentSettings.term || 'xterm-256color');
       const colorterm = currentSettings.colorterm ? encodeURIComponent(currentSettings.colorterm) : '';
       const rows = parseInt(currentSettings.termRows, 10) || 24;
       const cols = parseInt(currentSettings.termCols, 10) || 80;
-      return `${proto}//${location.host}/ws?session=${encodeURIComponent(sessionId)}&term=${term}&colorterm=${colorterm}&rows=${rows}&cols=${cols}`;
+      const url = `${proto}//${location.host}/ws?session=${encodeURIComponent(sessionId)}&term=${term}&colorterm=${colorterm}&rows=${rows}&cols=${cols}`;
+      return appendToken(url);
     }
 
     function updateUrl(sessionId) {
       if (!sessionId) return;
-      history.replaceState({}, '', '?session=' + encodeURIComponent(sessionId));
+      const params = new URLSearchParams(location.search);
+      params.set('session', sessionId);
+      history.replaceState({}, '', '?' + params.toString());
     }
 
     function newTerminal() {
@@ -500,6 +519,10 @@
       if (tab.reconnectTimer) {
         clearTimeout(tab.reconnectTimer);
         tab.reconnectTimer = null;
+      }
+      if (tab.keepaliveTimer) {
+        clearInterval(tab.keepaliveTimer);
+        tab.keepaliveTimer = null;
       }
       if (tab.ws) {
         try { tab.ws.onclose = null; } catch (e) {}
@@ -530,7 +553,7 @@
         if (typeof e.data === 'string') {
           try {
             const msg = JSON.parse(e.data);
-            if (msg.type === 'session_closed') {
+            if (msg.type === 'session_closed' || msg.type === 'error') {
               tab.intentionalClose = true;
               if (tab.ws && (tab.ws.readyState === WebSocket.OPEN || tab.ws.readyState === WebSocket.CONNECTING)) {
                 tab.ws.close();
@@ -608,15 +631,24 @@
 
       term.onResize(({ cols, rows }) => {
         const tab = tabs.find(t => t.id === sessionId);
-        if (tab && tab.ws && tab.ws.readyState === WebSocket.OPEN) {
-          tab.ws.send(JSON.stringify({ type: 'resize', cols, rows }));
-        }
+        if (!tab) return;
+        if (tab.resizeTimer) clearTimeout(tab.resizeTimer);
+        tab.resizeTimer = setTimeout(() => {
+          if (tab.ws && tab.ws.readyState === WebSocket.OPEN) {
+            tab.ws.send(JSON.stringify({ type: 'resize', cols, rows }));
+          }
+        }, 100);
       });
 
       term.onSelectionChange(() => {
         if (!currentSettings.copyOnSelect) return;
-        const text = term.getSelection();
-        if (text) copyToClipboard(text);
+        const tab = tabs.find(t => t.id === sessionId);
+        if (!tab) return;
+        if (tab.copyTimer) clearTimeout(tab.copyTimer);
+        tab.copyTimer = setTimeout(() => {
+          const text = term.getSelection();
+          if (text) copyToClipboard(text);
+        }, 100);
       });
 
       term.element.addEventListener('contextmenu', (e) => {
@@ -626,7 +658,7 @@
         pasteFromClipboard();
       });
 
-      const tab = { id: sessionId, sessionId, tabEl, container, term, fitAddon, ws: null, initialSync: true, intentionalClose: false };
+      const tab = { id: sessionId, sessionId, tabEl, container, term, fitAddon, ws: null, initialSync: true, intentionalClose: false, resizeTimer: null, copyTimer: null };
       tabs.push(tab);
 
       if (active) {
@@ -658,7 +690,8 @@
     }
 
     function closeSession(sessionId) {
-      return fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' })
+      const url = appendToken(`/api/sessions/${encodeURIComponent(sessionId)}`);
+      return fetch(url, { method: 'DELETE' })
         .catch(err => console.warn('close session failed', err));
     }
 
@@ -670,6 +703,8 @@
       tab.intentionalClose = true;
       if (tab.keepaliveTimer) clearInterval(tab.keepaliveTimer);
       if (tab.reconnectTimer) clearTimeout(tab.reconnectTimer);
+      if (tab.resizeTimer) clearTimeout(tab.resizeTimer);
+      if (tab.copyTimer) clearTimeout(tab.copyTimer);
 
       if (tab.ws) {
         if (tab.ws.readyState === WebSocket.OPEN) {
@@ -714,12 +749,12 @@
       updateEmptyState();
     }
 
-    window.addEventListener('resize', () => {
+    window.addEventListener('resize', debounce(() => {
       if (activeTabId && currentSettings.autoFit) {
         const tab = tabs.find(t => t.id === activeTabId);
         applyTabSize(tab);
       }
-    });
+    }, 150));
 
     window.addEventListener('beforeunload', () => {
       // Closing the browser page/tab must NOT kill the backend PTYs.
@@ -898,7 +933,7 @@
 
     async function init() {
       try {
-        const sessList = await fetch('/api/sessions').then(r => r.json());
+        const sessList = await fetch(appendToken('/api/sessions')).then(r => r.json());
         const querySid = getQuerySession();
 
         if (querySid && !sessList.find(s => s.id === querySid)) {
