@@ -515,6 +515,10 @@
       tab.intentionalClose = false;
 
       ws.onopen = () => {
+        if (tab.intentionalClose) {
+          if (tab.ws && tab.ws.readyState <= WebSocket.OPEN) tab.ws.close();
+          return;
+        }
         if (tab.tabEl && tab.tabEl.isConnected) tab.tabEl.style.opacity = '1';
         if (tab.id === activeTabId) {
           applyTabSize(tab);
@@ -523,7 +527,19 @@
       };
 
       ws.onmessage = (e) => {
-        if (typeof e.data === 'string') return;
+        if (typeof e.data === 'string') {
+          try {
+            const msg = JSON.parse(e.data);
+            if (msg.type === 'session_closed') {
+              tab.intentionalClose = true;
+              if (tab.ws && (tab.ws.readyState === WebSocket.OPEN || tab.ws.readyState === WebSocket.CONNECTING)) {
+                tab.ws.close();
+              }
+            }
+          } catch (err) {}
+          return;
+        }
+        if (!tab.term) return;
         if (tab.initialSync) {
           // In-band RIS (Reset to Initial State) instead of term.reset().
           // This clears the buffer and resets the parser synchronously with
@@ -641,6 +657,11 @@
       updateUrl(sessionId);
     }
 
+    function closeSession(sessionId) {
+      return fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' })
+        .catch(err => console.warn('close session failed', err));
+    }
+
     function closeTab(sessionId) {
       const idx = tabs.findIndex(t => t.id === sessionId);
       if (idx === -1) return;
@@ -649,11 +670,24 @@
       tab.intentionalClose = true;
       if (tab.keepaliveTimer) clearInterval(tab.keepaliveTimer);
       if (tab.reconnectTimer) clearTimeout(tab.reconnectTimer);
-      if (tab.ws && tab.ws.readyState === WebSocket.OPEN) {
-        tab.ws.send(JSON.stringify({ type: 'close' }));
-        tab.ws.close();
+
+      if (tab.ws) {
+        if (tab.ws.readyState === WebSocket.OPEN) {
+          tab.ws.send(JSON.stringify({ type: 'close' }));
+        }
+        if (tab.ws.readyState <= WebSocket.OPEN) {
+          tab.ws.close();
+        }
       }
-      tab.term.dispose();
+
+      // Also use the HTTP endpoint to guarantee the session is removed,
+      // especially when the WebSocket was not yet established or already gone.
+      closeSession(sessionId);
+
+      if (tab.term) {
+        tab.term.dispose();
+        tab.term = null;
+      }
       tab.tabEl.remove();
       tab.container.remove();
       tabs.splice(idx, 1);

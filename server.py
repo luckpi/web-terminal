@@ -10,6 +10,7 @@ import base64
 import json
 import logging
 import os
+import signal
 import termios
 import threading
 import time
@@ -73,7 +74,12 @@ class Session:
         self.closed = False
         self.created_at = time.time()
 
-        env = {**os.environ, "TERM": term}
+        # Start from a clean environment and only set COLORTERM when requested.
+        # This prevents the parent process's COLORTERM from leaking through
+        # when the frontend selects the empty "none" color mode.
+        env = os.environ.copy()
+        env.pop("COLORTERM", None)
+        env["TERM"] = term
         if colorterm:
             env["COLORTERM"] = colorterm
         logging.info("[%s] Spawning shell: %s in %s (TERM=%s, COLORTERM=%s, %dx%d)", self.id, shell, cwd, term, colorterm, cols, rows)
@@ -157,9 +163,9 @@ class Session:
             return
         self.closed = True
 
-        # Disconnect all WebSocket clients first.
+        # Notify all attached clients and close their sockets.
         for client in list(self.clients):
-            self.io_loop.add_callback(client.close)
+            self.io_loop.add_callback(client.close_after_notify)
         self.clients.clear()
 
         # Kill the underlying shell/PTY.
@@ -211,7 +217,7 @@ class TerminalWSHandler(tornado.websocket.WebSocketHandler):
         if mtype == "input":
             self.session.write(msg.get("data", ""))
         elif mtype == "resize":
-            self.session.resize(msg.get("rows", 24), msg.get("cols", 80))
+            self.session.resize(msg.get("rows", TERMINAL_ROWS), msg.get("cols", TERMINAL_COLS))
         elif mtype == "close":
             self.session.close()
             self.session = None
@@ -227,6 +233,17 @@ class TerminalWSHandler(tornado.websocket.WebSocketHandler):
             self.write_message(data, binary=True)
         except Exception:
             # Client probably went away; session cleanup happens in on_close.
+            pass
+
+    def close_after_notify(self):
+        """Notify the client that this session is closing, then close the socket."""
+        try:
+            self.write_message(json.dumps({"type": "session_closed"}), binary=False)
+        except Exception:
+            pass
+        try:
+            self.close()
+        except Exception:
             pass
 
 
@@ -254,12 +271,27 @@ class ApiSessionsHandler(tornado.web.RequestHandler):
         self.write(json.dumps(items))
 
 
+class ApiSessionHandler(tornado.web.RequestHandler):
+    """Close a specific session by ID."""
+
+    def delete(self, session_id):
+        session = sessions.get(session_id)
+        if not session:
+            self.set_status(404)
+            self.finish(json.dumps({"error": "session not found"}))
+            return
+        session.close()
+        self.set_status(204)
+        self.finish()
+
+
 def make_app():
     return tornado.web.Application(
         [
             (r"/", MainHandler),
             (r"/ws", TerminalWSHandler),
             (r"/api/sessions", ApiSessionsHandler),
+            (r"/api/sessions/([^/]+)", ApiSessionHandler),
         ],
         debug=False,
     )
@@ -273,9 +305,23 @@ if __name__ == "__main__":
     app = make_app()
     app.listen(PORT, address=HOST)
     logging.info("Web terminal listening on http://%s:%s", HOST, PORT)
-    try:
-        IOLoop.current().start()
-    except KeyboardInterrupt:
+
+    def shutdown():
         logging.info("Shutting down...")
         for s in list(sessions.values()):
             s.close()
+        IOLoop.current().stop()
+
+    def _handle_signal(signum, frame):
+        IOLoop.current().add_callback_from_signal(shutdown)
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
+    try:
+        IOLoop.current().start()
+    finally:
+        if sessions:
+            logging.info("Cleaning up remaining sessions...")
+            for s in list(sessions.values()):
+                s.close()
