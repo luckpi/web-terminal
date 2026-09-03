@@ -15,7 +15,8 @@
     #tabs::-webkit-scrollbar-thumb { background: #555; border-radius: 2px; }
     .tab { display: flex; align-items: center; gap: 6px; padding: 6px 10px; background: #3c3c3c; border-radius: 4px; cursor: pointer; white-space: nowrap; user-select: none; border: 1px solid transparent; min-height: 36px; flex-shrink: 0; }
     .tab.active { background: #0e639c; color: #fff; border-color: #1177bb; }
-    .tab .title { font-family: monospace; font-size: 12px; line-height: 1; white-space: nowrap; }
+    .tab .title { font-family: monospace; font-size: 12px; line-height: 1; white-space: nowrap; min-width: 24px; outline: none; cursor: text; }
+    .tab .title.editing { background: #1e1e1e; color: #d4d4d4; border: 1px solid #1177bb; border-radius: 3px; padding: 1px 4px; }
     .tab .close { display: flex; align-items: center; justify-content: center; font-weight: bold; padding: 0 4px; margin-left: 2px; cursor: pointer; border-radius: 3px; font-size: 14px; min-width: 24px; min-height: 24px; }
     .tab .close:hover { background: #c75450; color: #fff; }
     .tab-add { display: flex; align-items: center; justify-content: center; padding: 6px 10px; background: #2d2d2d; border: 1px solid #555; border-radius: 4px; color: #9cdcfe; cursor: pointer; font-size: 16px; line-height: 1; user-select: none; min-width: 36px; min-height: 36px; }
@@ -391,6 +392,23 @@
       localStorage.setItem(getSettingsKey(), JSON.stringify(currentSettings));
     }
 
+    const titlesKey = 'webterm-titles';
+    function loadSavedTitles() {
+      try {
+        return JSON.parse(localStorage.getItem(titlesKey)) || {};
+      } catch (e) {}
+      return {};
+    }
+    let savedTitles = loadSavedTitles();
+    function saveSavedTitles() {
+      localStorage.setItem(titlesKey, JSON.stringify(savedTitles));
+    }
+
+    function getTabTitle(sessionId) {
+      const saved = savedTitles[sessionId];
+      return (saved && saved.trim()) ? saved.trim() : sessionId.slice(0, 8);
+    }
+
     function getThemeObject() {
       return {
         background: currentSettings.background,
@@ -668,10 +686,20 @@
 
       const tabEl = document.createElement('div');
       tabEl.className = 'tab' + (active ? ' active' : '');
-      tabEl.innerHTML = `<span class="title">${sessionId.slice(0, 8)}</span><span class="close" title="${t('close')}">×</span>`;
+      const titleEl = document.createElement('span');
+      titleEl.className = 'title';
+      titleEl.textContent = getTabTitle(sessionId);
+      const closeEl = document.createElement('span');
+      closeEl.className = 'close';
+      closeEl.title = t('close');
+      closeEl.textContent = '×';
+      tabEl.appendChild(titleEl);
+      tabEl.appendChild(closeEl);
       tabEl.onclick = (e) => {
         if (e.target.classList.contains('close')) {
           closeTab(sessionId);
+        } else if (e.target.isContentEditable || e.detail > 1) {
+          // ignore clicks while editing title or during double-clicks
         } else {
           switchTab(sessionId);
         }
@@ -773,18 +801,12 @@
       }, { passive: true });
 
       const defaultTitle = sessionId.slice(0, 8);
-      const tab = { id: sessionId, sessionId, tabEl, container, term, fitAddon, searchAddon, searchTerm: '', ws: null, initialSync: true, intentionalClose: false, resizeTimer: null, copyTimer: null, title: defaultTitle };
+      const tab = { id: sessionId, sessionId, tabEl, container, term, fitAddon, searchAddon, searchTerm: '', ws: null, initialSync: true, intentionalClose: false, resizeTimer: null, copyTimer: null, title: getTabTitle(sessionId) };
       tabs.push(tab);
 
-      const titleEl = tabEl.querySelector('.title');
       titleEl.addEventListener('dblclick', (e) => {
         e.stopPropagation();
-        const tab = tabs.find(t => t.id === sessionId);
-        if (!tab) return;
-        const newTitle = prompt(t('renameTerminal'), tab.title);
-        if (newTitle === null) return;
-        tab.title = newTitle.trim() || defaultTitle;
-        titleEl.textContent = tab.title;
+        startInlineRename(titleEl, tab);
       });
 
       if (active) {
@@ -817,6 +839,46 @@
         tab.term.focus();
       }
       updateUrl(sessionId);
+    }
+
+    function startInlineRename(titleEl, tab) {
+      if (titleEl.isContentEditable) return;
+      titleEl.contentEditable = 'true';
+      titleEl.classList.add('editing');
+      titleEl.focus();
+      try {
+        const range = document.createRange();
+        range.selectNodeContents(titleEl);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+      } catch (e) {}
+
+      const finish = (save) => {
+        titleEl.contentEditable = 'false';
+        titleEl.classList.remove('editing');
+        titleEl.removeEventListener('blur', onBlur);
+        titleEl.removeEventListener('keydown', onKeydown);
+        if (save) {
+          const newTitle = titleEl.textContent.trim();
+          tab.title = newTitle || tab.sessionId.slice(0, 8);
+          savedTitles[tab.id] = tab.title;
+          saveSavedTitles();
+        }
+        titleEl.textContent = tab.title;
+      };
+      const onBlur = () => finish(true);
+      const onKeydown = (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          titleEl.blur();
+        } else if (e.key === 'Escape') {
+          e.preventDefault();
+          finish(false);
+        }
+      };
+      titleEl.addEventListener('blur', onBlur);
+      titleEl.addEventListener('keydown', onKeydown);
     }
 
     function closeSession(sessionId) {
@@ -856,6 +918,8 @@
       tab.tabEl.remove();
       tab.container.remove();
       tabs.splice(idx, 1);
+      delete savedTitles[sessionId];
+      saveSavedTitles();
 
       if (activeTabId === sessionId) {
         if (tabs.length) {
