@@ -696,6 +696,12 @@
       term.onData((data) => {
         const tab = tabs.find(t => t.id === sessionId);
         if (!tab || !tab.ws || tab.ws.readyState !== WebSocket.OPEN) return;
+        // xterm.js may respond to OSC 10/11/12 color queries by sending the
+        // reply back through onData. Over a network PTY that reply can arrive
+        // too late and be echoed as visible text. Suppress it here.
+        if (data.startsWith('\x1b]10;') || data.startsWith('\x1b]11;') || data.startsWith('\x1b]12;')) {
+          return;
+        }
         if (ctrlArmed) {
           let out = data;
           if (data.length === 1) {
