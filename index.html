@@ -50,7 +50,7 @@
     #shortcut-bar { display: none; box-sizing: border-box; width: 100%; gap: 4px; padding: 4px 6px; background: #2d2d2d; border-top: 1px solid #444; overflow-x: auto; -webkit-overflow-scrolling: touch; flex-shrink: 0; align-items: center; }
     body.mobile #shortcut-bar { display: flex; }
     #shortcut-bar button { padding: 4px 8px; font-size: 12px; background: #3c3c3c; color: #ddd; border: 1px solid #555; border-radius: 4px; white-space: nowrap; min-height: 30px; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
-    #shortcut-bar button:active { background: #0e639c; border-color: #1177bb; color: #fff; }
+    #shortcut-bar button:active, #shortcut-bar button.active { background: #0e639c; border-color: #1177bb; color: #fff; }
 
     .tab, .tab-add, .toolbar-btn, #shortcut-bar button { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
 
@@ -196,6 +196,10 @@
     const terminalArea = document.getElementById('terminal-area');
     const tabs = [];
     let activeTabId = null;
+    let ctrlArmed = false;
+    let altArmed = false;
+    let ctrlBtn = null;
+    let altBtn = null;
 
     const i18n = {
       zh: {
@@ -689,9 +693,28 @@
 
       term.onData((data) => {
         const tab = tabs.find(t => t.id === sessionId);
-        if (tab && tab.ws && tab.ws.readyState === WebSocket.OPEN) {
-          tab.ws.send(JSON.stringify({ type: 'input', data }));
+        if (!tab || !tab.ws || tab.ws.readyState !== WebSocket.OPEN) return;
+        if (ctrlArmed) {
+          let out = data;
+          if (data.length === 1) {
+            const code = data.charCodeAt(0);
+            if (code >= 97 && code <= 122) out = String.fromCharCode(code - 96);       // a-z
+            else if (code >= 65 && code <= 90) out = String.fromCharCode(code - 64);    // A-Z
+            else if (code >= 49 && code <= 57) out = String.fromCharCode(code - 48);    // 1-9
+          }
+          ctrlArmed = false;
+          updateModifierButtons();
+          tab.ws.send(JSON.stringify({ type: 'input', data: out }));
+          return;
         }
+        if (altArmed) {
+          const out = data.length === 1 ? ('\x1b' + data) : data;
+          altArmed = false;
+          updateModifierButtons();
+          tab.ws.send(JSON.stringify({ type: 'input', data: out }));
+          return;
+        }
+        tab.ws.send(JSON.stringify({ type: 'input', data }));
       });
 
       term.onResize(({ cols, rows }) => {
@@ -754,6 +777,9 @@
     }
 
     function switchTab(sessionId) {
+      ctrlArmed = false;
+      altArmed = false;
+      updateModifierButtons();
       for (const t of tabs) {
         const isActive = t.id === sessionId;
         t.tabEl.classList.toggle('active', isActive);
@@ -854,18 +880,17 @@
       }
     }
 
+    function updateModifierButtons() {
+      if (ctrlBtn) ctrlBtn.classList.toggle('active', ctrlArmed);
+      if (altBtn) altBtn.classList.toggle('active', altArmed);
+    }
+
     function renderShortcutBar() {
       const bar = document.getElementById('shortcut-bar');
       if (!bar) return;
       const shortcuts = [
-        { label: 'Ctrl+C', text: '\x03' },
-        { label: 'Ctrl+D', text: '\x04' },
-        { label: 'Ctrl+Z', text: '\x1A' },
-        { label: 'Ctrl+L', text: '\x0C' },
-        { label: 'Ctrl+U', text: '\x15' },
-        { label: 'Ctrl+A', text: '\x01' },
-        { label: 'Ctrl+E', text: '\x05' },
-        { label: 'Ctrl+K', text: '\x0B' },
+        { label: 'Ctrl', modifier: 'ctrl' },
+        { label: 'Alt', modifier: 'alt' },
         { label: 'Esc', text: '\x1B' },
         { label: 'Tab', text: '\t' },
         { label: '←', text: '\x1b[D' },
@@ -874,20 +899,43 @@
         { label: '↓', text: '\x1b[B' },
         { label: 'Home', text: '\x1b[H' },
         { label: 'End', text: '\x1b[F' },
+        { label: 'PgUp', text: '\x1b[5~' },
+        { label: 'PgDn', text: '\x1b[6~' },
         { label: '|', text: '|' },
         { label: '~', text: '~' },
-        { label: '_', text: '_' }
+        { label: '_', text: '_' },
+        { label: '`', text: '`' },
+        { label: '!', text: '!' },
+        { label: '$', text: '$' }
       ];
       bar.innerHTML = '';
       for (const s of shortcuts) {
         const btn = document.createElement('button');
         btn.textContent = s.label;
-        btn.addEventListener('click', (e) => {
-          e.preventDefault();
-          sendToActiveTerminal(s.text);
-        });
+        if (s.modifier) {
+          btn.dataset.modifier = s.modifier;
+          if (s.modifier === 'ctrl') ctrlBtn = btn;
+          if (s.modifier === 'alt') altBtn = btn;
+          btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            if (s.modifier === 'ctrl') {
+              ctrlArmed = !ctrlArmed;
+              if (ctrlArmed) altArmed = false;
+            } else {
+              altArmed = !altArmed;
+              if (altArmed) ctrlArmed = false;
+            }
+            updateModifierButtons();
+          });
+        } else {
+          btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            sendToActiveTerminal(s.text);
+          });
+        }
         bar.appendChild(btn);
       }
+      updateModifierButtons();
     }
 
     function disconnectAllTabs() {
