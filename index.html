@@ -7,21 +7,21 @@
   <link rel="stylesheet" href="/static/xterm.css" />
   <style>
     * { box-sizing: border-box; }
-    html, body { margin: 0; height: 100%; background: #1e1e1e; color: #ddd; font-family: system-ui, -apple-system, sans-serif; overflow: hidden; }
+    html, body { margin: 0; height: 100%; height: 100dvh; background: #1e1e1e; color: #ddd; font-family: system-ui, -apple-system, sans-serif; overflow: hidden; }
     body { display: flex; flex-direction: column; }
     #toolbar { display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: #2d2d2d; border-bottom: 1px solid #444; font-size: 13px; }
-    #tabs { display: flex; gap: 4px; align-items: center; flex: 1; overflow-x: auto; padding: 0 4px; }
+    #tabs { display: flex; gap: 4px; align-items: center; flex: 1; overflow-x: auto; -webkit-overflow-scrolling: touch; padding: 0 4px; }
     #tabs::-webkit-scrollbar { height: 4px; }
     #tabs::-webkit-scrollbar-thumb { background: #555; border-radius: 2px; }
-    .tab { display: flex; align-items: center; gap: 6px; padding: 5px 10px; background: #3c3c3c; border-radius: 4px; cursor: pointer; white-space: nowrap; user-select: none; border: 1px solid transparent; }
+    .tab { display: flex; align-items: center; gap: 6px; padding: 8px 10px; background: #3c3c3c; border-radius: 4px; cursor: pointer; white-space: nowrap; user-select: none; border: 1px solid transparent; min-height: 36px; }
     .tab.active { background: #0e639c; color: #fff; border-color: #1177bb; }
     .tab .title { font-family: monospace; font-size: 12px; }
-    .tab .close { font-weight: bold; padding: 0 4px; margin-left: 2px; cursor: pointer; border-radius: 3px; font-size: 14px; line-height: 1; }
+    .tab .close { font-weight: bold; padding: 4px 8px; margin-left: 2px; cursor: pointer; border-radius: 3px; font-size: 16px; line-height: 1; min-width: 28px; min-height: 28px; text-align: center; }
     .tab .close:hover { background: #c75450; color: #fff; }
-    .tab-add { display: flex; align-items: center; justify-content: center; padding: 5px 10px; background: #2d2d2d; border: 1px solid #555; border-radius: 4px; color: #9cdcfe; cursor: pointer; font-size: 16px; line-height: 1; user-select: none; min-width: 28px; }
+    .tab-add { display: flex; align-items: center; justify-content: center; padding: 8px 10px; background: #2d2d2d; border: 1px solid #555; border-radius: 4px; color: #9cdcfe; cursor: pointer; font-size: 16px; line-height: 1; user-select: none; min-width: 36px; min-height: 36px; }
     .tab-add:hover { background: #3c3c3c; border-color: #9cdcfe; color: #fff; }
     .toolbar-right { margin-left: auto; display: flex; gap: 6px; }
-    .toolbar-btn { padding: 5px 10px; border: none; border-radius: 4px; background: #3c3c3c; color: #ddd; cursor: pointer; font-size: 13px; }
+    .toolbar-btn { padding: 8px 12px; border: none; border-radius: 4px; background: #3c3c3c; color: #ddd; cursor: pointer; font-size: 13px; min-height: 36px; }
     .toolbar-btn:hover { background: #4c4c4c; }
     .toolbar-btn:disabled { background: #555; color: #999; cursor: not-allowed; }
     #terminal-area { flex: 1; position: relative; overflow: hidden; }
@@ -46,6 +46,21 @@
     .modal-actions button:hover { background: #1177bb; }
     .modal-actions .secondary { background: #555; }
     .modal-actions .secondary:hover { background: #666; }
+
+    @media (max-width: 640px) {
+      #toolbar { flex-wrap: wrap; padding: 4px 6px; gap: 4px; }
+      #tabs { width: 100%; order: 1; flex: 1 1 auto; min-width: 0; }
+      .toolbar-right { margin-left: 0; order: 0; width: 100%; justify-content: flex-end; }
+      .toolbar-btn { padding: 8px 12px; font-size: 14px; }
+      .modal-content { min-width: unset; width: 95vw; max-height: 80dvh; padding: 16px; }
+      .modal-content h3 { font-size: 18px; }
+      .modal-content label { flex-direction: column; align-items: stretch; gap: 4px; }
+      .modal-content input[type="text"], .modal-content input[type="number"], .modal-content select { width: 100%; }
+      .modal-actions { justify-content: space-between; }
+      .modal-actions button { flex: 1; padding: 10px; font-size: 14px; }
+      .term-container { top: 4px; left: 4px; right: 4px; bottom: 4px; }
+      .empty-state button { font-size: 18px; padding: 14px 28px; }
+    }
   </style>
 </head>
 <body>
@@ -672,6 +687,12 @@
         pasteFromClipboard();
       });
 
+      // On touch devices, tapping the terminal should focus it so the virtual
+      // keyboard can appear.
+      term.element.addEventListener('touchstart', () => {
+        try { term.focus(); } catch (e) {}
+      }, { passive: true });
+
       const defaultTitle = sessionId.slice(0, 8);
       const tab = { id: sessionId, sessionId, tabEl, container, term, fitAddon, searchAddon, searchTerm: '', ws: null, initialSync: true, intentionalClose: false, resizeTimer: null, copyTimer: null, title: defaultTitle };
       tabs.push(tab);
@@ -775,12 +796,20 @@
       updateEmptyState();
     }
 
-    window.addEventListener('resize', debounce(() => {
+    function updateLayout() {
+      // Use visualViewport height when available so the terminal stays within
+      // the visible area when the mobile virtual keyboard appears.
+      const h = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+      document.body.style.height = h + 'px';
       if (activeTabId && currentSettings.autoFit) {
         const tab = tabs.find(t => t.id === activeTabId);
         applyTabSize(tab);
       }
-    }, 150));
+    }
+    window.addEventListener('resize', debounce(updateLayout, 150));
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', debounce(updateLayout, 100));
+    }
 
     function disconnectAllTabs() {
       // Closing the browser page/tab must NOT kill the backend PTYs.
@@ -1014,6 +1043,7 @@
     });
 
     init();
+    updateLayout();
   </script>
 </body>
 </html>
