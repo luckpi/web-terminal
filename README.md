@@ -42,6 +42,9 @@ python3 server.py
 - 复制当前 URL 到另一个浏览器标签页，可以同时连接同一个终端。
 - 关闭页面后，终端仍在后台运行；重新打开相同 URL 即可恢复。
 - 点击「Close Terminal」会结束该会话的 shell 进程。
+- 双击标签页标题可重命名。
+- 快捷键：`Ctrl+Shift+T` 新建终端，`Ctrl+Shift+W` 关闭当前终端，`Ctrl+Shift+F` 搜索终端缓冲，`F3` / `Shift+F3` 查找下一个/上一个。
+- 所有 xterm.js、xterm-addon-fit、xterm-addon-search 资源都托管在本地 `static/`，无需联网即可使用。
 
 ## 测试
 
@@ -62,4 +65,3 @@ python3 test_client.py
 ## 已知限制
 
 - 服务端重启后所有会话会丢失。如需跨服务端重启保持会话，可改用 `tmux`/`screen` 作为中间层。
-- 第一次加载需要联网拉取 `xterm.js` 与 `xterm-addon-fit`（来自 jsDelivr CDN）。离线环境可下载后放到 `static/` 并修改 `index.html`。

@@ -19,6 +19,7 @@ from collections import deque
 import tornado.web
 import tornado.websocket
 from tornado.ioloop import IOLoop
+from tornado.iostream import StreamClosedError
 from ptyprocess import PtyProcess
 
 PORT = int(os.environ.get("PORT", "8765"))
@@ -88,6 +89,14 @@ class Session:
         self.buffer_bytes = 0
         self.closed = False
         self.created_at = time.time()
+
+        # Validate shell and cwd; fall back to safe defaults if necessary.
+        if not os.path.isfile(shell) or not os.access(shell, os.X_OK):
+            logging.warning("[%s] Shell %s is not executable, falling back to /bin/bash", self.id, shell)
+            shell = "/bin/bash"
+        if not os.path.isdir(cwd):
+            logging.warning("[%s] CWD %s is not a directory, falling back to %s", self.id, cwd, os.path.expanduser("~"))
+            cwd = os.path.expanduser("~")
 
         # Start from a clean environment and only set COLORTERM when requested.
         # This prevents the parent process's COLORTERM from leaking through
@@ -183,12 +192,17 @@ class Session:
             self.io_loop.add_callback(client.close_after_notify)
         self.clients.clear()
 
-        # Kill the underlying shell/PTY.
+        # Kill the underlying shell/PTY and close the master fd.
         try:
             if self.process and self.process.isalive():
                 self.process.terminate(force=True)
         except Exception:
             logging.exception("[%s] Terminate error", self.id)
+        try:
+            if self.process:
+                self.process.close()
+        except Exception:
+            logging.exception("[%s] Process close error", self.id)
 
         sessions.pop(self.id, None)
         logging.info("[%s] Session closed", self.id)
@@ -242,13 +256,23 @@ class TerminalWSHandler(tornado.websocket.WebSocketHandler):
         try:
             msg = json.loads(message)
         except Exception:
+            logging.warning("[%s] Malformed WebSocket message: %r", self.session_id, message[:200])
             return
 
         mtype = msg.get("type")
         if mtype == "input":
             self.session.write(msg.get("data", ""))
         elif mtype == "resize":
-            self.session.resize(msg.get("rows", TERMINAL_ROWS), msg.get("cols", TERMINAL_COLS))
+            rows = msg.get("rows", TERMINAL_ROWS)
+            cols = msg.get("cols", TERMINAL_COLS)
+            try:
+                rows = int(rows)
+                cols = int(cols)
+            except (ValueError, TypeError):
+                return
+            if rows <= 0 or cols <= 0 or rows > 500 or cols > 1000:
+                return
+            self.session.resize(rows, cols)
         elif mtype == "close":
             self.session.close()
             self.session = None
@@ -267,24 +291,34 @@ class TerminalWSHandler(tornado.websocket.WebSocketHandler):
     def safe_write(self, data):
         try:
             self.write_message(data, binary=True)
-        except Exception:
-            # Client probably went away; session cleanup happens in on_close.
+        except (tornado.websocket.WebSocketClosedError, StreamClosedError):
+            # Client went away; session cleanup happens in on_close.
             pass
+        except Exception:
+            logging.exception("[%s] Unexpected safe_write error", self.session_id or "?")
 
     def close_after_notify(self):
         """Notify the client that this session is closing, then close the socket."""
         try:
             self.write_message(json.dumps({"type": "session_closed"}), binary=False)
-        except Exception:
+        except (tornado.websocket.WebSocketClosedError, StreamClosedError):
             pass
+        except Exception:
+            logging.exception("[%s] close_after_notify write error", getattr(self, "session_id", "?"))
         try:
             self.close()
-        except Exception:
+        except (tornado.websocket.WebSocketClosedError, StreamClosedError):
             pass
+        except Exception:
+            logging.exception("[%s] close_after_notify close error", getattr(self, "session_id", "?"))
 
 
 class MainHandler(tornado.web.RequestHandler):
     def get(self):
+        self.set_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.set_header("Pragma", "no-cache")
+        self.set_header("Expires", "0")
+
         if not _check_token(self):
             self.set_status(403)
             self.set_header("Content-Type", "application/json")
@@ -292,12 +326,13 @@ class MainHandler(tornado.web.RequestHandler):
             return
 
         self.set_header("Content-Type", "text/html")
-        self.set_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
-        self.set_header("Pragma", "no-cache")
-        self.set_header("Expires", "0")
         html_path = os.path.join(os.path.dirname(__file__), "index.html")
-        with open(html_path, "rb") as f:
-            self.write(f.read())
+        try:
+            with open(html_path, "rb") as f:
+                self.write(f.read())
+        except FileNotFoundError:
+            self.set_status(404)
+            self.finish("index.html not found")
 
 
 class ApiSessionsHandler(tornado.web.RequestHandler):
@@ -319,6 +354,7 @@ class ApiSessionsHandler(tornado.web.RequestHandler):
             }
             for sid, s in sessions.items()
         ]
+        items.sort(key=lambda x: x["created_at"], reverse=True)
         self.write(json.dumps(items))
 
 
@@ -343,12 +379,14 @@ class ApiSessionHandler(tornado.web.RequestHandler):
 
 
 def make_app():
+    static_path = os.path.join(os.path.dirname(__file__), "static")
     return tornado.web.Application(
         [
             (r"/", MainHandler),
             (r"/ws", TerminalWSHandler),
             (r"/api/sessions", ApiSessionsHandler),
             (r"/api/sessions/([^/]+)", ApiSessionHandler),
+            (r"/static/(.*)", tornado.web.StaticFileHandler, {"path": static_path}),
         ],
         debug=False,
     )

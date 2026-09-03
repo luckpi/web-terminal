@@ -35,7 +35,7 @@ No additional packages are required.
 ## Architecture
 
 - `server.py`: Tornado HTTP + WebSocket server; manages `Session` objects, each wrapping a `PtyProcess`.
-- `index.html`: Browser terminal UI using xterm.js (loaded from CDN).
+- `index.html`: Browser terminal UI using xterm.js (loaded from local `static/`).
 - `test_client.py`: Async functional tests using `tornado.websocket.websocket_connect`.
 
 ## Notes
@@ -47,4 +47,7 @@ No additional packages are required.
 - Child shells are spawned with `TERM=xterm-256color` and `COLORTERM=truecolor` by default. Override with `WEB_TERMINAL_TERM` and `WEB_TERMINAL_COLORTERM`.
 - Default PTY dimensions are 80 columns x 24 rows (`TERMINAL_COLS` / `TERMINAL_ROWS`). The browser frontend resizes the PTY automatically when the container changes size.
 - `MAX_SESSIONS` (default `0`, unlimited) can cap the number of concurrent sessions.
-- `index.html` is served with `Cache-Control: no-store` and the xterm.js CDN assets use SRI hashes.
+- `index.html` is served with `Cache-Control: no-store`.
+- xterm.js, xterm-addon-fit, and xterm-addon-search are served from `static/` for offline use and SRI has been removed for local files.
+- Shortcuts: `Ctrl+Shift+T` new tab, `Ctrl+Shift+W` close tab, `Ctrl+Shift+F` search, `F3`/`Shift+F3` next/previous.
+- Double-click a tab title to rename it.

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Web Terminal</title>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/css/xterm.css" integrity="sha384-n2n7twoohnW+d3myBKaUgl7DSiwidw6MkQy9oesGzkPpMjejKRR3XlnD+5yCdtBD" crossorigin="anonymous" />
+  <link rel="stylesheet" href="/static/xterm.css" />
   <style>
     * { box-sizing: border-box; }
     html, body { margin: 0; height: 100%; background: #1e1e1e; color: #ddd; font-family: system-ui, -apple-system, sans-serif; overflow: hidden; }
@@ -151,8 +151,9 @@
     </div>
   </div>
 
-  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/lib/xterm.min.js" integrity="sha384-pELe6ZHtFxFcuYBq3gMkqvmnNIqUWnAYjBG5gThqQQCjWp8PJ/65MLK4lMIfEK1e" crossorigin="anonymous"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.11.0/lib/addon-fit.min.js" integrity="sha384-UwMkGaBqfOcrTjPjXdAPWrGQkhpxTJ21vKtTwLb6wBpBM8HQXKAiUuwVJfgY0Yw6" crossorigin="anonymous"></script>
+  <script src="/static/xterm.min.js"></script>
+  <script src="/static/addon-fit.min.js"></script>
+  <script src="/static/addon-search.min.js"></script>
   <script>
     const tabsEl = document.getElementById('tabs');
     const terminalArea = document.getElementById('terminal-area');
@@ -205,7 +206,9 @@
         cancel: '取消',
         reset: '重置',
         custom: '自定义',
-        close: '关闭终端'
+        close: '关闭终端',
+        renameTerminal: '重命名终端',
+        search: '搜索'
       },
       en: {
         newTerminal: 'New Terminal',
@@ -252,7 +255,9 @@
         cancel: 'Cancel',
         reset: 'Reset',
         custom: 'Custom',
-        close: 'Close terminal'
+        close: 'Close terminal',
+        renameTerminal: 'Rename terminal',
+        search: 'Search'
       }
     };
 
@@ -504,6 +509,13 @@
       history.replaceState({}, '', '?' + params.toString());
     }
 
+    function clearSessionFromUrl() {
+      const params = new URLSearchParams(location.search);
+      params.delete('session');
+      const qs = params.toString();
+      history.replaceState({}, '', qs ? '?' + qs : location.pathname);
+    }
+
     function newTerminal() {
       const sid = genSessionId();
       createTab(sid, true);
@@ -615,7 +627,9 @@
 
       const term = new Terminal(getTerminalOptions());
       const fitAddon = new FitAddon.FitAddon();
+      const searchAddon = new SearchAddon.SearchAddon();
       term.loadAddon(fitAddon);
+      term.loadAddon(searchAddon);
       term.open(container);
       // Set cursor options only after the terminal is attached to the DOM
       // to work around xterm.js not picking them up from the constructor.
@@ -658,8 +672,20 @@
         pasteFromClipboard();
       });
 
-      const tab = { id: sessionId, sessionId, tabEl, container, term, fitAddon, ws: null, initialSync: true, intentionalClose: false, resizeTimer: null, copyTimer: null };
+      const defaultTitle = sessionId.slice(0, 8);
+      const tab = { id: sessionId, sessionId, tabEl, container, term, fitAddon, searchAddon, searchTerm: '', ws: null, initialSync: true, intentionalClose: false, resizeTimer: null, copyTimer: null, title: defaultTitle };
       tabs.push(tab);
+
+      const titleEl = tabEl.querySelector('.title');
+      titleEl.addEventListener('dblclick', (e) => {
+        e.stopPropagation();
+        const tab = tabs.find(t => t.id === sessionId);
+        if (!tab) return;
+        const newTitle = prompt(t('renameTerminal'), tab.title);
+        if (newTitle === null) return;
+        tab.title = newTitle.trim() || defaultTitle;
+        titleEl.textContent = tab.title;
+      });
 
       if (active) {
         reconnectTab(tab);
@@ -732,7 +758,7 @@
           switchTab(tabs[0].id);
         } else {
           activeTabId = null;
-          history.replaceState({}, '', location.pathname);
+          clearSessionFromUrl();
         }
       }
       updateEmptyState();
@@ -741,7 +767,7 @@
     function closeAllTabs() {
       if (!tabs.length) return;
       activeTabId = null;
-      history.replaceState({}, '', location.pathname);
+      clearSessionFromUrl();
       // Close from the end to keep array index simple
       for (let i = tabs.length - 1; i >= 0; i--) {
         closeTab(tabs[i].id);
@@ -756,15 +782,19 @@
       }
     }, 150));
 
-    window.addEventListener('beforeunload', () => {
+    function disconnectAllTabs() {
       // Closing the browser page/tab must NOT kill the backend PTYs.
       tabs.forEach(t => {
         t.intentionalClose = true;
         if (t.keepaliveTimer) clearInterval(t.keepaliveTimer);
         if (t.reconnectTimer) clearTimeout(t.reconnectTimer);
+        if (t.resizeTimer) clearTimeout(t.resizeTimer);
+        if (t.copyTimer) clearTimeout(t.copyTimer);
         if (t.ws) t.ws.close();
       });
-    });
+    }
+    window.addEventListener('beforeunload', disconnectAllTabs);
+    window.addEventListener('pagehide', disconnectAllTabs);
 
     function toggleColorRows(show) {
       document.querySelectorAll('.color-row').forEach(el => {
@@ -954,6 +984,34 @@
       }
       updateEmptyState();
     }
+
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'F3') {
+        const tab = tabs.find(t => t.id === activeTabId);
+        if (tab && tab.searchAddon && tab.searchTerm) {
+          e.preventDefault();
+          if (e.shiftKey) tab.searchAddon.findPrevious(tab.searchTerm);
+          else tab.searchAddon.findNext(tab.searchTerm);
+        }
+        return;
+      }
+      if (!e.ctrlKey || !e.shiftKey) return;
+      if (e.key === 'T' || e.key === 't') {
+        e.preventDefault();
+        newTerminal();
+      } else if (e.key === 'W' || e.key === 'w') {
+        e.preventDefault();
+        if (activeTabId) closeTab(activeTabId);
+      } else if (e.key === 'F' || e.key === 'f') {
+        e.preventDefault();
+        const tab = tabs.find(t => t.id === activeTabId);
+        if (!tab || !tab.searchAddon) return;
+        const needle = prompt(t('search'), tab.searchTerm);
+        if (needle === null) return;
+        tab.searchTerm = needle.trim();
+        if (tab.searchTerm) tab.searchAddon.findNext(tab.searchTerm);
+      }
+    });
 
     init();
   </script>
