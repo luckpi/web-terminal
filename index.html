@@ -198,8 +198,10 @@
     let activeTabId = null;
     let ctrlArmed = false;
     let altArmed = false;
+    let shiftArmed = false;
     let ctrlBtn = null;
     let altBtn = null;
+    let shiftBtn = null;
 
     const i18n = {
       zh: {
@@ -714,6 +716,18 @@
           tab.ws.send(JSON.stringify({ type: 'input', data: out }));
           return;
         }
+        if (shiftArmed) {
+          const shiftMap = { '1': '!', '2': '@', '3': '#', '4': '$', '5': '%', '6': '^', '7': '&', '8': '*', '9': '(', '0': ')', '-': '_', '=': '+', '[': '{', ']': '}', '\\': '|', ';': ':', "'": '"', ',': '<', '.': '>', '/': '?', '`': '~' };
+          let out = data;
+          if (data.length === 1) {
+            if (shiftMap[data]) out = shiftMap[data];
+            else out = data.toUpperCase();
+          }
+          shiftArmed = false;
+          updateModifierButtons();
+          tab.ws.send(JSON.stringify({ type: 'input', data: out }));
+          return;
+        }
         tab.ws.send(JSON.stringify({ type: 'input', data }));
       });
 
@@ -779,6 +793,7 @@
     function switchTab(sessionId) {
       ctrlArmed = false;
       altArmed = false;
+      shiftArmed = false;
       updateModifierButtons();
       for (const t of tabs) {
         const isActive = t.id === sessionId;
@@ -883,6 +898,7 @@
     function updateModifierButtons() {
       if (ctrlBtn) ctrlBtn.classList.toggle('active', ctrlArmed);
       if (altBtn) altBtn.classList.toggle('active', altArmed);
+      if (shiftBtn) shiftBtn.classList.toggle('active', shiftArmed);
     }
 
     function renderShortcutBar() {
@@ -891,6 +907,7 @@
       const shortcuts = [
         { label: 'Ctrl', modifier: 'ctrl' },
         { label: 'Alt', modifier: 'alt' },
+        { label: 'Shift', modifier: 'shift' },
         { label: 'Esc', text: '\x1B' },
         { label: 'Tab', text: '\t' },
         { label: '←', text: '\x1b[D' },
@@ -916,14 +933,18 @@
           btn.dataset.modifier = s.modifier;
           if (s.modifier === 'ctrl') ctrlBtn = btn;
           if (s.modifier === 'alt') altBtn = btn;
+          if (s.modifier === 'shift') shiftBtn = btn;
           btn.addEventListener('click', (e) => {
             e.preventDefault();
             if (s.modifier === 'ctrl') {
               ctrlArmed = !ctrlArmed;
-              if (ctrlArmed) altArmed = false;
-            } else {
+              if (ctrlArmed) { altArmed = false; shiftArmed = false; }
+            } else if (s.modifier === 'alt') {
               altArmed = !altArmed;
-              if (altArmed) ctrlArmed = false;
+              if (altArmed) { ctrlArmed = false; shiftArmed = false; }
+            } else if (s.modifier === 'shift') {
+              shiftArmed = !shiftArmed;
+              if (shiftArmed) { ctrlArmed = false; altArmed = false; }
             }
             updateModifierButtons();
           });
