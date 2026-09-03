@@ -47,23 +47,42 @@
     .modal-actions .secondary { background: #555; }
     .modal-actions .secondary:hover { background: #666; }
 
+    #shortcut-bar { display: none; box-sizing: border-box; width: 100%; gap: 4px; padding: 4px 6px; background: #2d2d2d; border-top: 1px solid #444; overflow-x: auto; -webkit-overflow-scrolling: touch; flex-shrink: 0; align-items: center; }
+    body.mobile #shortcut-bar { display: flex; }
+    #shortcut-bar button { padding: 4px 8px; font-size: 12px; background: #3c3c3c; color: #ddd; border: 1px solid #555; border-radius: 4px; white-space: nowrap; min-height: 30px; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+    #shortcut-bar button:active { background: #0e639c; border-color: #1177bb; color: #fff; }
+
+    .tab, .tab-add, .toolbar-btn, #shortcut-bar button { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+
+    body.mobile .tab { padding: 6px 8px; min-height: 30px; }
+    body.mobile .tab .title { font-size: 12px; }
+    body.mobile .tab .close { padding: 2px 6px; font-size: 14px; min-width: 22px; min-height: 22px; }
+    body.mobile .tab-add { padding: 6px 8px; min-width: 30px; min-height: 30px; }
+    body.mobile .toolbar-btn { padding: 6px 8px; font-size: 12px; min-height: 30px; }
+    body.mobile #toolbar { padding: 4px 6px; gap: 4px; }
+
     @media (max-width: 640px) {
       #toolbar { flex-wrap: wrap; padding: 4px 6px; gap: 4px; }
       #tabs { width: 100%; order: 1; flex: 1 1 auto; min-width: 0; }
       .toolbar-right { margin-left: 0; order: 0; width: 100%; justify-content: flex-end; }
-      .toolbar-btn { padding: 8px 12px; font-size: 14px; }
+      .toolbar-btn { padding: 6px 8px; font-size: 12px; min-height: 30px; }
+      .tab { padding: 6px 8px; min-height: 30px; }
+      .tab .title { font-size: 12px; }
+      .tab .close { padding: 2px 6px; font-size: 14px; min-width: 22px; min-height: 22px; }
+      .tab-add { padding: 6px 8px; min-width: 30px; min-height: 30px; }
       .modal-content { min-width: unset; width: 95vw; max-height: 80dvh; padding: 16px; }
-      .modal-content h3 { font-size: 18px; }
+      .modal-content h3 { font-size: 16px; }
       .modal-content label { flex-direction: column; align-items: stretch; gap: 4px; }
       .modal-content input[type="text"], .modal-content input[type="number"], .modal-content select { width: 100%; }
-      .modal-actions { justify-content: space-between; }
-      .modal-actions button { flex: 1; padding: 10px; font-size: 14px; }
+      .modal-actions { justify-content: space-between; gap: 8px; }
+      .modal-actions button { flex: 1; padding: 8px; font-size: 13px; }
       .term-container { top: 4px; left: 4px; right: 4px; bottom: 4px; }
-      .empty-state button { font-size: 18px; padding: 14px 28px; }
+      .empty-state button { font-size: 16px; padding: 12px 24px; }
     }
   </style>
 </head>
 <body>
+  <script>if (window.matchMedia('(pointer: coarse)').matches) document.body.classList.add('mobile');</script>
   <div id="toolbar">
     <div id="tabs"></div>
     <div class="toolbar-right">
@@ -76,6 +95,8 @@
       <button class="toolbar-btn" onclick="newTerminal()" data-i18n="newTerminal">新建终端</button>
     </div>
   </div>
+
+  <div id="shortcut-bar"></div>
 
   <div id="settings-modal" class="modal">
     <div class="modal-content">
@@ -335,18 +356,32 @@
       termRows: 24
     };
 
+    function isTouchMobile() {
+      return window.matchMedia('(pointer: coarse)').matches;
+    }
+
+    function getSettingsKey() {
+      return isTouchMobile() ? 'webterm-settings-mobile' : 'webterm-settings';
+    }
+
+    const mobileDefaults = {
+      fontSize: 13,
+      scrollback: 5000
+    };
+
     function loadSettings() {
+      const base = isTouchMobile() ? { ...defaultSettings, ...mobileDefaults } : { ...defaultSettings };
       try {
-        const saved = JSON.parse(localStorage.getItem('webterm-settings'));
-        if (saved) return { ...defaultSettings, ...saved };
+        const saved = JSON.parse(localStorage.getItem(getSettingsKey()));
+        if (saved) return { ...base, ...saved };
       } catch (e) {}
-      return { ...defaultSettings };
+      return base;
     }
 
     let currentSettings = loadSettings();
 
     function saveSettings() {
-      localStorage.setItem('webterm-settings', JSON.stringify(currentSettings));
+      localStorage.setItem(getSettingsKey(), JSON.stringify(currentSettings));
     }
 
     function getThemeObject() {
@@ -811,6 +846,49 @@
       window.visualViewport.addEventListener('resize', debounce(updateLayout, 100));
     }
 
+    function sendToActiveTerminal(text) {
+      const tab = tabs.find(t => t.id === activeTabId);
+      if (tab && tab.ws && tab.ws.readyState === WebSocket.OPEN) {
+        tab.ws.send(JSON.stringify({ type: 'input', data: text }));
+      }
+    }
+
+    function renderShortcutBar() {
+      const bar = document.getElementById('shortcut-bar');
+      if (!bar) return;
+      const shortcuts = [
+        { label: 'Ctrl+C', text: '\x03' },
+        { label: 'Ctrl+D', text: '\x04' },
+        { label: 'Ctrl+Z', text: '\x1A' },
+        { label: 'Ctrl+L', text: '\x0C' },
+        { label: 'Ctrl+U', text: '\x15' },
+        { label: 'Ctrl+A', text: '\x01' },
+        { label: 'Ctrl+E', text: '\x05' },
+        { label: 'Ctrl+K', text: '\x0B' },
+        { label: 'Esc', text: '\x1B' },
+        { label: 'Tab', text: '\t' },
+        { label: '←', text: '\x1b[D' },
+        { label: '→', text: '\x1b[C' },
+        { label: '↑', text: '\x1b[A' },
+        { label: '↓', text: '\x1b[B' },
+        { label: 'Home', text: '\x1b[H' },
+        { label: 'End', text: '\x1b[F' },
+        { label: '|', text: '|' },
+        { label: '~', text: '~' },
+        { label: '_', text: '_' }
+      ];
+      bar.innerHTML = '';
+      for (const s of shortcuts) {
+        const btn = document.createElement('button');
+        btn.textContent = s.label;
+        btn.addEventListener('click', (e) => {
+          e.preventDefault();
+          sendToActiveTerminal(s.text);
+        });
+        bar.appendChild(btn);
+      }
+    }
+
     function disconnectAllTabs() {
       // Closing the browser page/tab must NOT kill the backend PTYs.
       tabs.forEach(t => {
@@ -1044,6 +1122,7 @@
 
     init();
     updateLayout();
+    renderShortcutBar();
   </script>
 </body>
 </html>

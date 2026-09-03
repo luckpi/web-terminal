@@ -51,3 +51,5 @@ No additional packages are required.
 - xterm.js, xterm-addon-fit, and xterm-addon-search are served from `static/` for offline use and SRI has been removed for local files.
 - Shortcuts: `Ctrl+Shift+T` new tab, `Ctrl+Shift+W` close tab, `Ctrl+Shift+F` search, `F3`/`Shift+F3` next/previous.
 - Double-click a tab title to rename it.
+- Mobile devices get a compact `body.mobile` style and a bottom shortcut bar with common keys (Ctrl+C, Esc, arrows, Tab, pipe, tilde, etc.).
+- Mobile and desktop settings are stored separately in `localStorage` based on `pointer: coarse` detection.

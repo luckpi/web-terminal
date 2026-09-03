@@ -44,6 +44,8 @@ python3 server.py
 - 点击「Close Terminal」会结束该会话的 shell 进程。
 - 双击标签页标题可重命名。
 - 快捷键：`Ctrl+Shift+T` 新建终端，`Ctrl+Shift+W` 关闭当前终端，`Ctrl+Shift+F` 搜索终端缓冲，`F3` / `Shift+F3` 查找下一个/上一个。
+- 手机端自适应：触控设备会自动切换为 `mobile` 样式，按钮和标签更紧凑，底部增加常用快捷键栏（Ctrl+C、Esc、方向键、Tab、|、~ 等）。
+- 手机与电脑配置独立保存（基于触控检测使用不同的 `localStorage` 键）。
 - 所有 xterm.js、xterm-addon-fit、xterm-addon-search 资源都托管在本地 `static/`，无需联网即可使用。
 
 ## 测试
