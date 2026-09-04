@@ -662,6 +662,7 @@
           tab.term.write('\x1bc');
           tab.initialSync = false;
         }
+        if (tab.cancelInertia) tab.cancelInertia();
         tab.term.write(new Uint8Array(e.data));
       };
 
@@ -688,13 +689,14 @@
       return 20;
     }
 
-    function setupTouchScroll(host, terminal, sessionId) {
-      if (!isTouchMobile()) return;
+    function setupTouchScroll(host, terminal, sessionId, tabObj) {
+      if (!isTouchMobile()) return null;
       let startX = 0, startY = 0, startTime = 0;
       let lastX = 0, lastY = 0, lastMoveTime = 0;
       let scrollActive = false, swipeActive = false, ignore = false;
       let remainder = 0, rowHeight = 0;
       let velocity = 0, inertiaRaf = 0;
+      let startViewportHeight = 0;
       const TAKEOVER_PX = 16;
       const SWIPE_THRESHOLD = 60;
       const TAP_TIME = 300;
@@ -717,6 +719,7 @@
           inertiaRaf = 0;
         }
       }
+      if (tabObj) tabObj.cancelInertia = cancelInertia;
 
       function inertiaStep(now) {
         const dt = Math.max(now - lastMoveTime, 1);
@@ -737,6 +740,7 @@
         startX = lastX = t.clientX;
         startY = lastY = t.clientY;
         startTime = lastMoveTime = performance.now();
+        startViewportHeight = window.visualViewport ? window.visualViewport.height : window.innerHeight;
         velocity = 0;
         remainder = 0;
       }
@@ -745,6 +749,15 @@
         if (ignore) return;
         if (e.touches.length !== 1) { ignore = true; scrollActive = false; swipeActive = false; return; }
         const t = e.touches[0];
+        const currentHeight = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+        if (currentHeight !== startViewportHeight) {
+          // visualViewport changed mid-gesture (e.g. keyboard popped up);
+          // reset the coordinate baseline to avoid a fake scroll jump.
+          startViewportHeight = currentHeight;
+          lastX = t.clientX;
+          lastY = t.clientY;
+          return;
+        }
         const dx = t.clientX - startX;
         const dy = t.clientY - startY;
         const adx = Math.abs(dx);
@@ -815,6 +828,8 @@
       host.addEventListener('touchmove', onTouchMove, { passive: false });
       host.addEventListener('touchend', onTouchEnd, { passive: true });
       host.addEventListener('touchcancel', onTouchCancel, { passive: true });
+
+      return cancelInertia;
     }
 
     function createTab(sessionId, active = false) {
@@ -864,6 +879,9 @@
       term.onData((data) => {
         const tab = tabs.find(t => t.id === sessionId);
         if (!tab || !tab.ws || tab.ws.readyState !== WebSocket.OPEN) return;
+        // Stop any fling scroll so user input (e.g. virtual keyboard) does
+        // not fight the viewport.
+        if (tab.cancelInertia) tab.cancelInertia();
         // xterm.js may respond to OSC 10/11/12 color queries by sending the
         // reply back through onData. Over a network PTY that reply can arrive
         // too late and be echoed as visible text. Suppress it here.
@@ -934,13 +952,13 @@
         pasteFromClipboard();
       });
 
+      const defaultTitle = sessionId.slice(0, 8);
+      const tab = { id: sessionId, sessionId, tabEl, container, term, fitAddon, searchAddon, searchTerm: '', ws: null, initialSync: true, intentionalClose: false, resizeTimer: null, copyTimer: null, title: getTabTitle(sessionId), cancelInertia: null };
+      tabs.push(tab);
+
       // On touch devices, handle terminal scroll with momentum and left/right
       // swipe to switch tabs. Tapping focuses the terminal.
-      setupTouchScroll(container, term, sessionId);
-
-      const defaultTitle = sessionId.slice(0, 8);
-      const tab = { id: sessionId, sessionId, tabEl, container, term, fitAddon, searchAddon, searchTerm: '', ws: null, initialSync: true, intentionalClose: false, resizeTimer: null, copyTimer: null, title: getTabTitle(sessionId) };
-      tabs.push(tab);
+      tab.cancelInertia = setupTouchScroll(container, term, sessionId, tab);
 
       titleEl.addEventListener('dblclick', (e) => {
         e.stopPropagation();
@@ -1094,6 +1112,11 @@
     window.addEventListener('resize', debounce(updateLayout, 150));
     if (window.visualViewport) {
       window.visualViewport.addEventListener('resize', debounce(updateLayout, 100));
+      window.visualViewport.addEventListener('resize', () => {
+        // Keyboard or address-bar changes can shift touch coordinates and
+        // cause in-flight fling scrolls to feel jumpy; stop them.
+        tabs.forEach(t => t.cancelInertia && t.cancelInertia());
+      });
     }
 
     function sendToActiveTerminal(text) {
