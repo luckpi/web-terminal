@@ -52,9 +52,9 @@
     body.mobile #shortcut-bar { display: flex; }
     #shortcut-bar button { padding: 4px 8px; font-size: 12px; background: #3c3c3c; color: #ddd; border: 1px solid #555; border-radius: 4px; white-space: nowrap; min-height: 30px; cursor: pointer; touch-action: pan-x; -webkit-tap-highlight-color: transparent; }
 
-    .xterm .xterm-viewport { touch-action: pan-y; -webkit-overflow-scrolling: touch; }
-    body.mobile .xterm .xterm-viewport::-webkit-scrollbar { width: 8px; }
-    body.mobile .xterm .xterm-viewport::-webkit-scrollbar-thumb { background: #555; border-radius: 4px; }
+    .xterm .xterm-viewport, .xterm .xterm-screen, .xterm .xterm-screen canvas { touch-action: pan-y; -webkit-overflow-scrolling: touch; overscroll-behavior-y: contain; }
+    body.mobile .xterm .xterm-viewport::-webkit-scrollbar { width: 10px; }
+    body.mobile .xterm .xterm-viewport::-webkit-scrollbar-thumb { background: #555; border-radius: 5px; }
     #shortcut-bar button:active, #shortcut-bar button.active { background: #0e639c; border-color: #1177bb; color: #fff; }
 
     .tab, .tab-add, .toolbar-btn, #shortcut-bar button { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
@@ -681,6 +681,142 @@
       setupKeepalive(tab);
     }
 
+    function getRowHeight(host, terminal) {
+      if (terminal.rows > 0 && host.clientHeight > 0) return host.clientHeight / terminal.rows;
+      const canvas = host.querySelector('.xterm-screen canvas');
+      if (canvas && terminal.rows > 0) return canvas.clientHeight / terminal.rows;
+      return 20;
+    }
+
+    function setupTouchScroll(host, terminal, sessionId) {
+      if (!isTouchMobile()) return;
+      let startX = 0, startY = 0, startTime = 0;
+      let lastX = 0, lastY = 0, lastMoveTime = 0;
+      let scrollActive = false, swipeActive = false, ignore = false;
+      let remainder = 0, rowHeight = 0;
+      let velocity = 0, inertiaRaf = 0;
+      const TAKEOVER_PX = 16;
+      const SWIPE_THRESHOLD = 60;
+      const TAP_TIME = 300;
+      const TAP_DIST = 12;
+      const FLING_MIN_V = 0.12;
+      const STOP_V = 0.02;
+      const FRICTION = 0.94;
+
+      function scrollByPx(px) {
+        const total = remainder + px;
+        if (rowHeight <= 0) return;
+        const lines = Math.trunc(total / rowHeight);
+        remainder = total - lines * rowHeight;
+        if (lines !== 0) terminal.scrollLines(-lines);
+      }
+
+      function cancelInertia() {
+        if (inertiaRaf) {
+          cancelAnimationFrame(inertiaRaf);
+          inertiaRaf = 0;
+        }
+      }
+
+      function inertiaStep(now) {
+        const dt = Math.max(now - lastMoveTime, 1);
+        lastMoveTime = now;
+        velocity *= Math.pow(FRICTION, dt / 16.6667);
+        if (Math.abs(velocity) < STOP_V) { inertiaRaf = 0; return; }
+        scrollByPx(velocity * dt);
+        inertiaRaf = requestAnimationFrame(inertiaStep);
+      }
+
+      function onTouchStart(e) {
+        cancelInertia();
+        scrollActive = false;
+        swipeActive = false;
+        ignore = e.touches.length !== 1;
+        if (ignore) return;
+        const t = e.touches[0];
+        startX = lastX = t.clientX;
+        startY = lastY = t.clientY;
+        startTime = lastMoveTime = performance.now();
+        velocity = 0;
+        remainder = 0;
+      }
+
+      function onTouchMove(e) {
+        if (ignore) return;
+        if (e.touches.length !== 1) { ignore = true; scrollActive = false; swipeActive = false; return; }
+        const t = e.touches[0];
+        const dx = t.clientX - startX;
+        const dy = t.clientY - startY;
+        const adx = Math.abs(dx);
+        const ady = Math.abs(dy);
+
+        if (!scrollActive && !swipeActive) {
+          if (Math.max(adx, ady) <= TAKEOVER_PX) return;
+          if (ady > adx) {
+            scrollActive = true;
+            rowHeight = getRowHeight(host, terminal);
+          } else {
+            swipeActive = true;
+          }
+        }
+
+        if (scrollActive) {
+          e.preventDefault();
+          const now = performance.now();
+          const moveDy = t.clientY - lastY;
+          const dt = Math.max(now - lastMoveTime, 1);
+          velocity = velocity * 0.2 + (moveDy / dt) * 0.8;
+          lastMoveTime = now;
+          lastY = t.clientY;
+          scrollByPx(moveDy);
+        } else if (swipeActive) {
+          e.preventDefault();
+        }
+      }
+
+      function onTouchEnd(e) {
+        if (ignore) return;
+        const now = performance.now();
+        const t = e.changedTouches[0];
+        const dx = t.clientX - startX;
+        const dy = t.clientY - startY;
+        if (swipeActive) {
+          swipeActive = false;
+          if (Math.abs(dx) > SWIPE_THRESHOLD) {
+            const idx = tabs.findIndex(tt => tt.id === sessionId);
+            if (idx !== -1) {
+              if (dx < 0 && idx < tabs.length - 1) switchTab(tabs[idx + 1].id);
+              else if (dx > 0 && idx > 0) switchTab(tabs[idx - 1].id);
+            }
+          }
+          return;
+        }
+        if (scrollActive) {
+          scrollActive = false;
+          if (e.touches.length > 0) return;
+          if (now - lastMoveTime > 60) return;
+          if (Math.abs(velocity) < FLING_MIN_V) return;
+          lastMoveTime = performance.now();
+          inertiaRaf = requestAnimationFrame(inertiaStep);
+          return;
+        }
+        if (now - startTime < TAP_TIME && Math.max(Math.abs(dx), Math.abs(dy)) < TAP_DIST) {
+          try { terminal.focus(); } catch (err) {}
+        }
+      }
+
+      function onTouchCancel() {
+        scrollActive = false;
+        swipeActive = false;
+        cancelInertia();
+      }
+
+      host.addEventListener('touchstart', onTouchStart, { passive: true });
+      host.addEventListener('touchmove', onTouchMove, { passive: false });
+      host.addEventListener('touchend', onTouchEnd, { passive: true });
+      host.addEventListener('touchcancel', onTouchCancel, { passive: true });
+    }
+
     function createTab(sessionId, active = false) {
       const existing = tabs.find(t => t.id === sessionId);
       if (existing) {
@@ -798,36 +934,9 @@
         pasteFromClipboard();
       });
 
-      // On touch devices, tapping the terminal should focus it so the virtual
-      // keyboard can appear. Also support left/right swipe to switch tabs.
-      let swipeStartX = 0, swipeStartY = 0, swipeStarted = false;
-      term.element.addEventListener('touchstart', (e) => {
-        try { term.focus(); } catch (err) {}
-        if (e.touches.length !== 1) return;
-        swipeStartX = e.touches[0].clientX;
-        swipeStartY = e.touches[0].clientY;
-        swipeStarted = true;
-      }, { passive: true });
-      term.element.addEventListener('touchmove', (e) => {
-        if (!swipeStarted || e.touches.length !== 1) return;
-        const dx = e.touches[0].clientX - swipeStartX;
-        const dy = e.touches[0].clientY - swipeStartY;
-        if (Math.abs(dx) > 20 && Math.abs(dx) > Math.abs(dy)) {
-          e.preventDefault();
-        }
-      }, { passive: false });
-      term.element.addEventListener('touchend', (e) => {
-        if (!swipeStarted) return;
-        swipeStarted = false;
-        const dx = e.changedTouches[0].clientX - swipeStartX;
-        const dy = e.changedTouches[0].clientY - swipeStartY;
-        if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy)) {
-          const idx = tabs.findIndex(t => t.id === sessionId);
-          if (idx === -1) return;
-          if (dx < 0 && idx < tabs.length - 1) switchTab(tabs[idx + 1].id);
-          else if (dx > 0 && idx > 0) switchTab(tabs[idx - 1].id);
-        }
-      });
+      // On touch devices, handle terminal scroll with momentum and left/right
+      // swipe to switch tabs. Tapping focuses the terminal.
+      setupTouchScroll(container, term, sessionId);
 
       const defaultTitle = sessionId.slice(0, 8);
       const tab = { id: sessionId, sessionId, tabEl, container, term, fitAddon, searchAddon, searchTerm: '', ws: null, initialSync: true, intentionalClose: false, resizeTimer: null, copyTimer: null, title: getTabTitle(sessionId) };
