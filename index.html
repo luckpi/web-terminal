@@ -649,6 +649,10 @@
               if (tab.ws && (tab.ws.readyState === WebSocket.OPEN || tab.ws.readyState === WebSocket.CONNECTING)) {
                 tab.ws.close();
               }
+              // Expired/invalid auth: go back to the login page.
+              if (msg.type === 'error' && /token/i.test(msg.message || '')) {
+                location.href = '/login';
+              }
             }
           } catch (err) {}
           return;
@@ -1370,8 +1374,22 @@
     }
 
     async function init() {
+      // Drop ?token= from the address bar: the server has already issued an
+      // auth cookie for this session, so the token does not need to stay in
+      // browser history.
+      const urlParams = new URLSearchParams(location.search);
+      if (urlParams.has('token')) {
+        urlParams.delete('token');
+        const qs = urlParams.toString();
+        history.replaceState({}, '', qs ? '?' + qs : location.pathname);
+      }
       try {
-        const sessList = await fetch(appendToken('/api/sessions')).then(r => r.json());
+        const resp = await fetch(appendToken('/api/sessions'));
+        if (resp.status === 401 || resp.status === 403) {
+          location.href = '/login';
+          return;
+        }
+        const sessList = await resp.json();
         const querySid = getQuerySession();
 
         if (querySid && !sessList.find(s => s.id === querySid)) {

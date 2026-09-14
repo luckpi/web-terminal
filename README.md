@@ -30,10 +30,13 @@ python3 server.py
 ### 环境变量
 
 - `PORT`：监听端口，默认 `8765`。
-- `HOST`：监听地址，默认 `127.0.0.1`；如需局域网访问可设为 `0.0.0.0`（注意安全）。
+- `HOST`：监听地址，默认 `127.0.0.1`；如需局域网访问可设为 `0.0.0.0`（当前部署即为 `0.0.0.0`，**务必设置 `TOKEN`**）。
 - `SHELL`：启动的 shell，默认 `$SHELL` 或 `/bin/bash`。
+- `CWD`：新会话的工作目录，默认用户主目录。
+- `TERMINAL_ROWS` / `TERMINAL_COLS`：新建 PTY 的默认尺寸，默认 `24` / `80`。
+- `WEB_TERMINAL_TERM` / `WEB_TERMINAL_COLORTERM`：子 shell 的 `TERM` / `COLORTERM`，默认 `xterm-256color` / `truecolor`。
 - `MAX_BUFFER`：会话重连时回放的最近输出字节数，默认 `100000`。
-- `TOKEN`：可选访问令牌。设置后所有 HTTP 和 WebSocket 请求都需要在 URL 中携带 `?token=<TOKEN>` 或 `X-Token` 请求头。
+- `TOKEN`：访问口令。**设置后启用认证**：浏览器访问会先跳转到 `/login` 登录页，输入口令后获得 `HttpOnly` cookie（30 天有效）；也兼容 URL `?token=<TOKEN>` 或 `X-Token` 请求头（供脚本使用）。`?token=` 登录成功后会自动换成 cookie，前端会把 token 从地址栏移除。访问 `/logout` 可登出。口令不会传给子 shell（`env` 中不可见）。
 - `MAX_SESSIONS`：最大并发会话数，默认 `0`（不限制）。达到上限后新建会话会返回错误。
 
 ## 使用说明
@@ -52,16 +55,17 @@ python3 server.py
 
 ```bash
 cd /home/gumy/桌面/web-terminal
-python3 test_client.py
+TOKEN=<服务口令> python3 test_client.py   # 服务启用 TOKEN 时需要
 ```
 
 测试用例覆盖：基本输入输出、断开后进程保留、点击关闭后端 PTY 被终止。
 
 ## 安全提示
 
-- 默认仅监听 `127.0.0.1`，不要直接暴露到公网。
-- 如需远程使用，请加反向代理（nginx/traefik）并配置身份验证（OAuth、Basic Auth 等）。
-- 也可以设置 `TOKEN` 环境变量开启简单令牌认证（通过 URL `?token=<TOKEN>` 或 `X-Token` 头传递）。
+- 当前部署监听 `0.0.0.0`（局域网可达），**已启用 `TOKEN` 认证**：未登录访问一律跳转到登录页；`/api/*`、`/static/*`、`/ws` 全部需要认证。
+- 认证失败会按 IP 做指数退避限速（第 4 次失败起延迟 2s/4s/8s... 封顶 30s）。
+- 口令校验使用 `hmac.compare_digest` 常量时间比较；cookie 为 `HttpOnly` + `SameSite=Lax`（顺带阻止跨站 WebSocket 携带凭据）。
+- 不要暴露到公网。如需远程使用，建议 Tailscale/WireGuard 或反向代理（nginx/traefik）+ HTTPS。
 - 服务端以当前用户身份运行 shell，拥有当前用户的全部权限。
 
 ## 已知限制

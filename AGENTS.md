@@ -8,7 +8,8 @@ This is a self-contained Python/Tornado web terminal.
 - Run tests: `python3 test_client.py`
 - Server URL: `http://127.0.0.1:8765/`
 - WebSocket endpoint: `ws://127.0.0.1:8765/ws?session=<id>`
-- Optional token authentication: set `TOKEN` env and append `?token=<TOKEN>` to all URLs (or use `X-Token` header).
+- Authentication: `TOKEN` env is the login password. Browsers authenticate via `GET/POST /login` which sets an `HttpOnly`+`SameSite=Lax` cookie (30 days); `?token=`/`X-Token` remain as fallbacks for scripts. `GET /logout` clears the cookie. All endpoints incl. `/static/*` require auth when TOKEN is set. Failed attempts are throttled per-IP (exponential backoff after 3 failures).
+- When running tests with auth enabled: `TOKEN=<password> python3 test_client.py`.
 - Session management API: `GET /api/sessions`, `DELETE /api/sessions/<id>`.
 
 ## Systemd user service
@@ -51,5 +52,5 @@ No additional packages are required.
 - xterm.js, xterm-addon-fit, and xterm-addon-search are served from `static/` for offline use and SRI has been removed for local files.
 - Shortcuts: `Ctrl+Shift+T` new tab, `Ctrl+Shift+W` close tab, `Ctrl+Shift+F` search, `F3`/`Shift+F3` next/previous.
 - Double-click a tab title to rename it.
-- Mobile devices get a compact `body.mobile` style and a bottom shortcut bar with common keys (Ctrl+C, Esc, arrows, Tab, pipe, tilde, etc.).
+- Mobile devices get a compact `body.mobile` style and a bottom shortcut bar with modifier keys (Ctrl/Alt/Shift arm once for the next input) plus Esc, Tab, arrows, Home/End/PgUp/PgDn and hard-to-type symbols.
 - Mobile and desktop settings are stored separately in `localStorage` based on `pointer: coarse` detection.

@@ -8,9 +8,12 @@ closes the corresponding terminal tab (which sends a `close` message).
 
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
+import re
 import signal
 import termios
 import threading
@@ -43,6 +46,23 @@ TOKEN = os.environ.get("TOKEN", "")
 # Maximum number of active sessions. 0 means unlimited.
 MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "0"))
 
+# Cookie-based authentication. /login verifies the password (TOKEN) and sets
+# this cookie; its value is an HMAC of the password so it carries no usable
+# secret. The cookie is HttpOnly and SameSite=Lax, which also prevents
+# cross-site WebSocket handshakes from carrying it.
+AUTH_COOKIE = "webterm_auth"
+COOKIE_SECRET = (
+    hmac.new(TOKEN.encode("utf-8"), b"web-terminal-auth", hashlib.sha256).hexdigest()
+    if TOKEN else ""
+)
+COOKIE_MAX_AGE = 30 * 86400
+
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+ENV_VALUE_RE = re.compile(r"^[A-Za-z0-9._+-]{1,64}$")
+
+# remote_ip -> (failed_attempts, last_attempt); used to throttle brute force.
+_auth_failures = {}
+
 # session_id -> Session
 sessions = {}
 
@@ -51,14 +71,50 @@ def make_session_id():
     return base64.urlsafe_b64encode(os.urandom(12)).decode("ascii").rstrip("=")
 
 
+def _hmac_eq(a, b):
+    try:
+        return hmac.compare_digest(a, b)
+    except TypeError:
+        return False
+
+
 def _check_token(handler):
-    """Validate the request token when TOKEN is configured."""
+    """Validate request auth when TOKEN is configured.
+
+    Accepts the auth cookie set by /login, a ?token= query argument, or the
+    X-Token header.
+    """
     if not TOKEN:
+        return True
+    cookie = handler.get_cookie(AUTH_COOKIE)
+    if cookie and _hmac_eq(cookie, COOKIE_SECRET):
         return True
     token = handler.get_argument("token", default=None)
     if not token:
         token = handler.request.headers.get("X-Token")
-    return token == TOKEN
+    return _hmac_eq(token, TOKEN) if token else False
+
+
+def _presented_credential(handler):
+    """True when the request offered an explicit credential worth throttling."""
+    return bool(
+        handler.get_argument("token", default=None)
+        or handler.request.headers.get("X-Token")
+    )
+
+
+def _clear_auth_failures(handler):
+    _auth_failures.pop(handler.request.remote_ip, None)
+
+
+async def _throttle_auth_failure(handler):
+    """Slow down repeated authentication failures from the same client."""
+    ip = handler.request.remote_ip
+    count, _ = _auth_failures.get(ip, (0, 0))
+    count += 1
+    _auth_failures[ip] = (count, time.time())
+    if count > 3:
+        await asyncio.sleep(min(2 ** (count - 3), 30))
 
 
 def _preexec_setup_pty():
@@ -104,6 +160,9 @@ class Session:
         # when the frontend selects the empty "none" color mode.
         env = os.environ.copy()
         env.pop("COLORTERM", None)
+        # Never hand the access token to child shells; it would be visible
+        # via `env` and /proc/<pid>/environ.
+        env.pop("TOKEN", None)
         env["TERM"] = term
         if colorterm:
             env["COLORTERM"] = colorterm
@@ -229,6 +288,7 @@ class TerminalWSHandler(tornado.websocket.WebSocketHandler):
 
     async def open(self):
         if not _check_token(self):
+            await _throttle_auth_failure(self)
             try:
                 await self.write_message(json.dumps({"type": "error", "message": "invalid or missing token"}), binary=False)
             except Exception:
@@ -239,6 +299,13 @@ class TerminalWSHandler(tornado.websocket.WebSocketHandler):
         sid = self.get_argument("session", default=None)
         if not sid:
             sid = make_session_id()
+        elif not SESSION_ID_RE.match(sid):
+            try:
+                await self.write_message(json.dumps({"type": "error", "message": "invalid session id"}), binary=False)
+            except Exception:
+                pass
+            self.close()
+            return
 
         if sid not in sessions:
             if MAX_SESSIONS and len(sessions) >= MAX_SESSIONS:
@@ -250,7 +317,11 @@ class TerminalWSHandler(tornado.websocket.WebSocketHandler):
                 return
 
             term = self.get_argument("term", default=TERM)
+            if not ENV_VALUE_RE.match(term or ""):
+                term = TERM
             colorterm = self.get_argument("colorterm", default=COLORTERM)
+            if colorterm and not ENV_VALUE_RE.match(colorterm):
+                colorterm = COLORTERM
             try:
                 rows = int(self.get_argument("rows", default=TERMINAL_ROWS))
             except (ValueError, TypeError):
@@ -258,6 +329,10 @@ class TerminalWSHandler(tornado.websocket.WebSocketHandler):
             try:
                 cols = int(self.get_argument("cols", default=TERMINAL_COLS))
             except (ValueError, TypeError):
+                cols = TERMINAL_COLS
+            if not 1 <= rows <= 500:
+                rows = TERMINAL_ROWS
+            if not 1 <= cols <= 1000:
                 cols = TERMINAL_COLS
             sessions[sid] = Session(sid, IOLoop.current(), shell=SHELL, cwd=CWD, term=term, colorterm=colorterm, rows=rows, cols=cols)
 
@@ -340,16 +415,22 @@ class TerminalWSHandler(tornado.websocket.WebSocketHandler):
 
 
 class MainHandler(tornado.web.RequestHandler):
-    def get(self):
+    async def get(self):
         self.set_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
         self.set_header("Pragma", "no-cache")
         self.set_header("Expires", "0")
 
         if not _check_token(self):
-            self.set_status(403)
-            self.set_header("Content-Type", "application/json")
-            self.finish(json.dumps({"error": "invalid or missing token"}))
+            if _presented_credential(self):
+                await _throttle_auth_failure(self)
+            self.redirect("/login")
             return
+
+        # Upgrade a valid ?token= URL to the auth cookie so the frontend can
+        # strip the token from the address bar and keep it out of history.
+        if TOKEN and self.get_argument("token", default=None):
+            self.set_cookie(AUTH_COOKIE, COOKIE_SECRET, httponly=True,
+                            samesite="Lax", max_age=COOKIE_MAX_AGE)
 
         self.set_header("Content-Type", "text/html")
         html_path = os.path.join(os.path.dirname(__file__), "index.html")
@@ -364,8 +445,10 @@ class MainHandler(tornado.web.RequestHandler):
 class ApiSessionsHandler(tornado.web.RequestHandler):
     """Return the list of currently active sessions."""
 
-    def get(self):
+    async def get(self):
         if not _check_token(self):
+            if _presented_credential(self):
+                await _throttle_auth_failure(self)
             self.set_status(403)
             self.set_header("Content-Type", "application/json")
             self.finish(json.dumps({"error": "invalid or missing token"}))
@@ -387,8 +470,10 @@ class ApiSessionsHandler(tornado.web.RequestHandler):
 class ApiSessionHandler(tornado.web.RequestHandler):
     """Close a specific session by ID."""
 
-    def delete(self, session_id):
+    async def delete(self, session_id):
         if not _check_token(self):
+            if _presented_credential(self):
+                await _throttle_auth_failure(self)
             self.set_status(403)
             self.set_header("Content-Type", "application/json")
             self.finish(json.dumps({"error": "invalid or missing token"}))
@@ -404,15 +489,98 @@ class ApiSessionHandler(tornado.web.RequestHandler):
         self.finish()
 
 
+LOGIN_PAGE = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Web Terminal - Login</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; display: flex; align-items: center;
+         justify-content: center; background: #1e1e1e; color: #ddd;
+         font-family: system-ui, -apple-system, sans-serif; }
+  form { background: #2d2d2d; padding: 32px; border-radius: 8px;
+         border: 1px solid #444; display: flex; flex-direction: column;
+         gap: 14px; min-width: 300px; max-width: 90vw; }
+  h2 { margin: 0; font-size: 18px; font-weight: 600; }
+  input { background: #1e1e1e; color: #ddd; border: 1px solid #555;
+          border-radius: 4px; padding: 10px; font-size: 14px; }
+  input:focus { outline: none; border-color: #1177bb; }
+  button { background: #0e639c; color: #fff; border: none; border-radius: 4px;
+           padding: 10px; font-size: 14px; cursor: pointer; }
+  button:hover { background: #1177bb; }
+  .error { color: #f48771; font-size: 12px; min-height: 14px; }
+</style>
+</head>
+<body>
+<form method="post" action="/login">
+  <h2>Web Terminal</h2>
+  <input type="password" name="password" placeholder="Password / 密码"
+         autofocus autocomplete="current-password">
+  <div class="error">%(error)s</div>
+  <button type="submit">登录 / Login</button>
+</form>
+</body>
+</html>"""
+
+
+class LoginHandler(tornado.web.RequestHandler):
+    """Password login page; sets the auth cookie on success."""
+
+    def get(self):
+        if not TOKEN or _check_token(self):
+            self.redirect("/")
+            return
+        self.set_header("Content-Type", "text/html")
+        self.write(LOGIN_PAGE % {"error": ""})
+
+    async def post(self):
+        if not TOKEN:
+            self.redirect("/")
+            return
+        password = self.get_body_argument("password", default="")
+        if _hmac_eq(password, TOKEN):
+            _clear_auth_failures(self)
+            self.set_cookie(AUTH_COOKIE, COOKIE_SECRET, httponly=True,
+                            samesite="Lax", max_age=COOKIE_MAX_AGE)
+            self.redirect("/")
+            return
+        await _throttle_auth_failure(self)
+        self.set_status(403)
+        self.set_header("Content-Type", "text/html")
+        self.write(LOGIN_PAGE % {"error": "密码错误 / Wrong password"})
+
+
+class LogoutHandler(tornado.web.RequestHandler):
+    def get(self):
+        self.clear_cookie(AUTH_COOKIE)
+        self.redirect("/login")
+
+
+class AuthStaticFileHandler(tornado.web.StaticFileHandler):
+    """Static files are behind auth as well when TOKEN is configured."""
+
+    async def get(self, path, include_body=True):
+        if not _check_token(self):
+            self.set_status(403)
+            self.set_header("Content-Type", "application/json")
+            self.finish(json.dumps({"error": "invalid or missing token"}))
+            return
+        await super().get(path, include_body=include_body)
+
+
 def make_app():
     static_path = os.path.join(os.path.dirname(__file__), "static")
     return tornado.web.Application(
         [
             (r"/", MainHandler),
+            (r"/login", LoginHandler),
+            (r"/logout", LogoutHandler),
             (r"/ws", TerminalWSHandler),
             (r"/api/sessions", ApiSessionsHandler),
             (r"/api/sessions/([^/]+)", ApiSessionHandler),
-            (r"/static/(.*)", tornado.web.StaticFileHandler, {"path": static_path}),
+            (r"/static/(.*)", AuthStaticFileHandler, {"path": static_path}),
         ],
         debug=False,
     )

@@ -3,11 +3,20 @@
 
 import asyncio
 import json
+import os
 import re
 
 from tornado.websocket import websocket_connect
 
 HOST = "ws://127.0.0.1:8765"
+TOKEN = os.environ.get("TOKEN", "")
+
+
+def ws_url(path):
+    if not TOKEN:
+        return f"{HOST}{path}"
+    sep = "&" if "?" in path else "?"
+    return f"{HOST}{path}{sep}token={TOKEN}"
 
 
 async def collect_output(ws, idle_timeout=0.6, max_wait=5.0):
@@ -30,7 +39,7 @@ async def collect_output(ws, idle_timeout=0.6, max_wait=5.0):
 
 async def test_basic_io():
     print("--- test_basic_io ---")
-    ws = await websocket_connect(f"{HOST}/ws?session=test_basic")
+    ws = await websocket_connect(ws_url("/ws?session=test_basic"))
     await asyncio.sleep(0.3)
     banner = await collect_output(ws, idle_timeout=0.5)
     print("banner:", repr(banner[:200]))
@@ -50,7 +59,7 @@ async def test_persistence():
     print("--- test_persistence ---")
     session = "test_persist"
 
-    ws1 = await websocket_connect(f"{HOST}/ws?session={session}")
+    ws1 = await websocket_connect(ws_url(f"/ws?session={session}"))
     await asyncio.sleep(0.3)
     await collect_output(ws1, idle_timeout=0.5)
 
@@ -69,7 +78,7 @@ async def test_persistence():
     await asyncio.sleep(0.5)
 
     # Reconnect to the same session.
-    ws2 = await websocket_connect(f"{HOST}/ws?session={session}")
+    ws2 = await websocket_connect(ws_url(f"/ws?session={session}"))
     await asyncio.sleep(0.3)
     replay = await collect_output(ws2, idle_timeout=0.8)
     print("reconnect replay length:", len(replay))
@@ -92,7 +101,7 @@ async def test_close():
     print("--- test_close ---")
     session = "test_close"
 
-    ws = await websocket_connect(f"{HOST}/ws?session={session}")
+    ws = await websocket_connect(ws_url(f"/ws?session={session}"))
     await asyncio.sleep(0.3)
     await collect_output(ws, idle_timeout=0.5)
 
@@ -104,7 +113,7 @@ async def test_close():
     await asyncio.sleep(0.6)
 
     # Reconnecting to the same session must start a brand-new PTY.
-    ws2 = await websocket_connect(f"{HOST}/ws?session={session}")
+    ws2 = await websocket_connect(ws_url(f"/ws?session={session}"))
     await asyncio.sleep(0.5)
     await ws2.write_message(json.dumps({"type": "input", "data": "echo after_close\n"}))
     out = await collect_output(ws2, idle_timeout=0.8)
