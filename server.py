@@ -6,6 +6,7 @@ browser tab only closes the WebSocket; the PTY stays alive until the user
 closes the corresponding terminal tab (which sends a `close` message).
 """
 
+import asyncio
 import base64
 import json
 import logging
@@ -120,7 +121,12 @@ class Session:
         self._reader_thread.start()
 
     def _reader(self):
-        """Background thread that reads PTY output and forwards it."""
+        """Background thread that reads PTY output and forwards it.
+
+        This thread only blocks on read().  All mutation of the replay
+        buffer and the client set happens on the IOLoop thread via
+        add_callback, so no locking is needed.
+        """
         try:
             while not self.closed:
                 try:
@@ -130,11 +136,11 @@ class Session:
                 if not data:
                     break
 
-                self._append_output(data)
-                if self.clients:
-                    self._broadcast(data)
+                self.io_loop.add_callback(self._on_pty_data, data)
         except Exception:
-            logging.exception("[%s] Reader error", self.id)
+            # A closed master fd during session teardown is expected.
+            if not self.closed:
+                logging.exception("[%s] Reader error", self.id)
         finally:
             try:
                 status = self.process.isalive()
@@ -142,7 +148,18 @@ class Session:
             except Exception:
                 status, exit_code = None, None
             logging.info("[%s] PTY reader ended; isalive=%s exitstatus=%s", self.id, status, exit_code)
-            self.io_loop.add_callback(self.close)
+            try:
+                self.io_loop.add_callback(self.close)
+            except Exception:
+                pass
+
+    def _on_pty_data(self, data):
+        """Buffer a chunk of PTY output and broadcast it. IOLoop thread only."""
+        if self.closed:
+            return
+        self._append_output(data)
+        for client in list(self.clients):
+            client.safe_write(data)
 
     def _append_output(self, data):
         self.buffer.append(data)
@@ -151,15 +168,14 @@ class Session:
             removed = self.buffer.popleft()
             self.buffer_bytes -= len(removed)
 
-    def _broadcast(self, data):
-        for client in list(self.clients):
-            self.io_loop.add_callback(client.safe_write, data)
-
     def add_client(self, client):
         self.clients.add(client)
+        # The buffer is only mutated on the IOLoop thread, so joining it here
+        # is safe; output produced later is broadcast in queue order and can
+        # never overtake this replay.
         replay = b"".join(self.buffer)
         if replay:
-            self.io_loop.add_callback(client.safe_write, replay)
+            client.safe_write(replay)
 
     def remove_client(self, client):
         self.clients.discard(client)
@@ -277,10 +293,7 @@ class TerminalWSHandler(tornado.websocket.WebSocketHandler):
             self.session.close()
             self.session = None
         elif mtype == "ping":
-            try:
-                self.write_message(json.dumps({"type": "pong"}), binary=False)
-            except Exception:
-                pass
+            self._send(json.dumps({"type": "pong"}), binary=False)
 
     def on_close(self):
         if self.session:
@@ -288,23 +301,36 @@ class TerminalWSHandler(tornado.websocket.WebSocketHandler):
             self.session.remove_client(self)
             self.session = None
 
-    def safe_write(self, data):
+    def _send(self, data, binary=True):
+        """Write a message, swallowing both sync and async socket errors."""
         try:
-            self.write_message(data, binary=True)
+            future = self.write_message(data, binary=binary)
         except (tornado.websocket.WebSocketClosedError, StreamClosedError):
-            # Client went away; session cleanup happens in on_close.
-            pass
+            return
         except Exception:
-            logging.exception("[%s] Unexpected safe_write error", self.session_id or "?")
+            logging.exception("[%s] Write error", getattr(self, "session_id", "?"))
+            return
+        if future is not None:
+            future.add_done_callback(self._send_done)
+
+    def _send_done(self, future):
+        # Retrieve async write failures so asyncio does not report them as
+        # "Task exception was never retrieved" when a peer vanishes mid-write.
+        try:
+            exc = future.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is None or isinstance(exc, (tornado.websocket.WebSocketClosedError, StreamClosedError)):
+            return
+        logging.error("[%s] Async write error: %r", getattr(self, "session_id", "?"), exc)
+
+    def safe_write(self, data):
+        # Client going away mid-write is fine; cleanup happens in on_close.
+        self._send(data, binary=True)
 
     def close_after_notify(self):
         """Notify the client that this session is closing, then close the socket."""
-        try:
-            self.write_message(json.dumps({"type": "session_closed"}), binary=False)
-        except (tornado.websocket.WebSocketClosedError, StreamClosedError):
-            pass
-        except Exception:
-            logging.exception("[%s] close_after_notify write error", getattr(self, "session_id", "?"))
+        self._send(json.dumps({"type": "session_closed"}), binary=False)
         try:
             self.close()
         except (tornado.websocket.WebSocketClosedError, StreamClosedError):
