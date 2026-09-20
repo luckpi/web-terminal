@@ -1225,12 +1225,17 @@ async function init() {
   updateEmptyState();
 }
 
+// Capture phase: xterm consumes (stopPropagation) keys it handles on its
+// textarea, so a bubble-phase listener never sees them while a terminal is
+// focused. Handling at window-capture intercepts before that happens; keys
+// we don't claim must continue propagating to xterm untouched.
 window.addEventListener('keydown', (e) => {
   if (e.target && e.target.isContentEditable) return;
+  const swallow = () => { e.preventDefault(); e.stopPropagation(); };
   if (e.key === 'F3') {
     const tab = tabs.find(t => t.id === activeTabId);
     if (tab && tab.searchAddon && tab.searchTerm) {
-      e.preventDefault();
+      swallow();
       if (e.shiftKey) tab.searchAddon.findPrevious(tab.searchTerm);
       else tab.searchAddon.findNext(tab.searchTerm);
     }
@@ -1241,10 +1246,10 @@ window.addEventListener('keydown', (e) => {
   // (reopen closed tab / close the whole window) before the page sees them.
   if (e.altKey && !e.ctrlKey && !e.shiftKey) {
     if (e.code === 'KeyN') {
-      e.preventDefault();
+      swallow();
       newTerminal();
     } else if (e.code === 'KeyW') {
-      e.preventDefault();
+      swallow();
       if (activeTabId) closeTab(activeTabId);
     }
     return;
@@ -1252,13 +1257,13 @@ window.addEventListener('keydown', (e) => {
   if (!e.ctrlKey || !e.shiftKey) return;
   // Fallback for contexts that do deliver Ctrl+Shift+T/W (e.g. installed PWA).
   if (e.key === 'T' || e.key === 't') {
-    e.preventDefault();
+    swallow();
     newTerminal();
   } else if (e.key === 'W' || e.key === 'w') {
-    e.preventDefault();
+    swallow();
     if (activeTabId) closeTab(activeTabId);
   } else if (e.key === 'F' || e.key === 'f') {
-    e.preventDefault();
+    swallow();
     const tab = tabs.find(t => t.id === activeTabId);
     if (!tab || !tab.searchAddon) return;
     const needle = prompt(t('search'), tab.searchTerm);
@@ -1266,7 +1271,7 @@ window.addEventListener('keydown', (e) => {
     tab.searchTerm = needle.trim();
     if (tab.searchTerm) tab.searchAddon.findNext(tab.searchTerm);
   }
-});
+}, true);
 
 init();
 updateLayout();

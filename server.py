@@ -386,6 +386,7 @@ class TerminalWSHandler(tornado.websocket.WebSocketHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._pending_bytes = 0
+        self._dropped = False
 
     async def open(self):
         if not _check_token(self):
@@ -494,8 +495,11 @@ class TerminalWSHandler(tornado.websocket.WebSocketHandler):
         exceeds MAX_WS_PENDING_BYTES: a peer that stops reading would
         otherwise let PTY output pile up in memory indefinitely.
         """
+        if self._dropped:
+            return
         size = len(data) if isinstance(data, (bytes, bytearray, memoryview)) else len(data.encode("utf-8"))
         if MAX_WS_PENDING_BYTES and self._pending_bytes + size > MAX_WS_PENDING_BYTES:
+            self._dropped = True
             logging.warning("[%s] Client %d bytes behind, dropping connection",
                             getattr(self, "session_id", "?"), self._pending_bytes + size)
             self.close()
