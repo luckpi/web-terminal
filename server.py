@@ -708,6 +708,11 @@ class LogoutHandler(tornado.web.RequestHandler):
 class AuthStaticFileHandler(tornado.web.StaticFileHandler):
     """Static files are behind auth as well when TOKEN is configured."""
 
+    def set_extra_headers(self, path):
+        # Small local assets — force revalidation so a browser never runs a
+        # stale app.js after a server upgrade (304s are cheap on localhost).
+        self.set_header("Cache-Control", "no-cache")
+
     async def get(self, path, include_body=True):
         if not _check_token(self):
             # Keep the same brute-force throttling as every other endpoint;
