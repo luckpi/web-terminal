@@ -6,6 +6,7 @@ import json
 import os
 import re
 
+from tornado.httpclient import AsyncHTTPClient, HTTPRequest
 from tornado.websocket import websocket_connect
 
 HOST = "ws://127.0.0.1:8765"
@@ -126,10 +127,98 @@ async def test_close():
     print("OK\n")
 
 
+async def test_resize():
+    print("--- test_resize ---")
+    ws = await websocket_connect(ws_url("/ws?session=test_resize"))
+    await asyncio.sleep(0.3)
+    await collect_output(ws, idle_timeout=0.5)
+
+    await ws.write_message(json.dumps({"type": "resize", "rows": 33, "cols": 111}))
+    await asyncio.sleep(0.3)
+    await ws.write_message(json.dumps({"type": "input", "data": "stty size\n"}))
+    out = await collect_output(ws, idle_timeout=0.8)
+    print("stty size:", repr(out[:200]))
+    assert b"33 111" in out
+
+    # Out-of-range resize values are ignored.
+    await ws.write_message(json.dumps({"type": "resize", "rows": 99999, "cols": -1}))
+    await asyncio.sleep(0.3)
+    await ws.write_message(json.dumps({"type": "input", "data": "stty size\n"}))
+    out = await collect_output(ws, idle_timeout=0.8)
+    assert b"33 111" in out
+
+    await ws.write_message(json.dumps({"type": "close"}))
+    await asyncio.sleep(0.3)
+    ws.close()
+    print("OK\n")
+
+
+async def test_http_api():
+    print("--- test_http_api ---")
+    client = AsyncHTTPClient()
+
+    # Open a session so it shows up in the API listing.
+    ws = await websocket_connect(ws_url("/ws?session=test_api"))
+    await asyncio.sleep(0.3)
+    await collect_output(ws, idle_timeout=0.5)
+
+    headers = {"X-Token": TOKEN} if TOKEN else {}
+    resp = await client.fetch("http://127.0.0.1:8765/api/sessions", headers=headers)
+    sessions = json.loads(resp.body.decode())
+    ids = [s["id"] for s in sessions]
+    print("sessions:", ids)
+    assert "test_api" in ids
+
+    # DELETE removes the session.
+    req = HTTPRequest(
+        f"http://127.0.0.1:8765/api/sessions/test_api",
+        method="DELETE", headers=headers,
+    )
+    resp = await client.fetch(req)
+    assert resp.code == 204
+    ws.close()
+    print("OK\n")
+
+
+async def test_auth_rejection():
+    """Only meaningful when the server runs with TOKEN set."""
+    print("--- test_auth_rejection ---")
+    if not TOKEN:
+        print("TOKEN unset, skipping\n")
+        return
+    client = AsyncHTTPClient()
+
+    # Bad token -> 403 on API and static files; no token on / redirects to /login.
+    resp = await client.fetch(
+        "http://127.0.0.1:8765/api/sessions?token=wrong", raise_error=False)
+    assert resp.code == 403, resp.code
+    resp = await client.fetch(
+        "http://127.0.0.1:8765/static/xterm.css?token=wrong", raise_error=False)
+    assert resp.code == 403, resp.code
+    resp = await client.fetch(
+        "http://127.0.0.1:8765/", raise_error=False, follow_redirects=False)
+    assert resp.code == 302, resp.code
+
+    # WS handshake with bad token is rejected (error message then close).
+    try:
+        ws = await websocket_connect("ws://127.0.0.1:8765/ws?session=x&token=wrong")
+    except Exception:
+        ws = None
+    else:
+        msg = await ws.read_message()
+        assert msg is None or b"token" in (
+            msg if isinstance(msg, bytes) else msg.encode()), msg
+        ws.close()
+    print("OK\n")
+
+
 async def main():
     await test_basic_io()
     await test_persistence()
     await test_close()
+    await test_resize()
+    await test_http_api()
+    await test_auth_rejection()
     print("All tests passed.")
 
 

@@ -13,6 +13,7 @@ import hmac
 import json
 import logging
 import os
+import queue
 import re
 import signal
 import termios
@@ -20,6 +21,7 @@ import threading
 import time
 from collections import deque
 
+import tornado.httpserver
 import tornado.web
 import tornado.websocket
 from tornado.ioloop import IOLoop
@@ -44,18 +46,31 @@ MAX_BUFFER_BYTES = int(os.environ.get("MAX_BUFFER", "100000"))
 # a matching token in the query string or in the X-Token header.
 TOKEN = os.environ.get("TOKEN", "")
 # Maximum number of active sessions. 0 means unlimited.
-MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "0"))
+MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "32"))
+# Maximum bytes of outbound data buffered per WebSocket client. A client
+# that stops reading (hung connection, dead browser) would otherwise let
+# terminal output pile up in memory.
+MAX_WS_PENDING_BYTES = int(os.environ.get("MAX_WS_PENDING", "8388608"))
+# Set to 1 when running behind a trusted reverse proxy so remote_ip honours
+# X-Real-Ip/X-Forwarded-For. Must only be enabled behind a trusted proxy,
+# otherwise clients can spoof their IP.
+XHEADERS = os.environ.get("XHEADERS", "") not in ("", "0", "false", "no")
 
 # Cookie-based authentication. /login verifies the password (TOKEN) and sets
-# this cookie; its value is an HMAC of the password so it carries no usable
-# secret. The cookie is HttpOnly and SameSite=Lax, which also prevents
-# cross-site WebSocket handshakes from carrying it.
+# this cookie. The cookie value is a per-boot random HMAC keyed by the
+# password, so a leaked cookie stops working when the server restarts (all
+# terminal sessions die on restart anyway) and it carries no usable secret.
+# The cookie is HttpOnly and SameSite=Lax, which also prevents cross-site
+# WebSocket handshakes from carrying it.
 AUTH_COOKIE = "webterm_auth"
 COOKIE_SECRET = (
-    hmac.new(TOKEN.encode("utf-8"), b"web-terminal-auth", hashlib.sha256).hexdigest()
+    hmac.new(TOKEN.encode("utf-8"), os.urandom(32), hashlib.sha256).hexdigest()
     if TOKEN else ""
 )
 COOKIE_MAX_AGE = 30 * 86400
+
+AUTH_FAIL_TTL = 3600  # reset a client's failure count after this quiet period
+AUTH_FAIL_MAX_IPS = 1024  # bound the size of the failure bookkeeping table
 
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 ENV_VALUE_RE = re.compile(r"^[A-Za-z0-9._+-]{1,64}$")
@@ -65,6 +80,28 @@ _auth_failures = {}
 
 # session_id -> Session
 sessions = {}
+
+_TOKEN_QS_RE = re.compile(r"([?&]token=)[^&]*")
+
+
+def _log_request(handler):
+    """Access log with the ?token= credential redacted.
+
+    Tornado's default log_function logs the full request URI, which would
+    write the access token to the server log whenever a script uses
+    ?token=. Redact it here (same format as tornado.log.access_log).
+    """
+    status = handler.get_status()
+    if status < 400:
+        log_method = logging.info
+    elif status < 500:
+        log_method = logging.warning
+    else:
+        log_method = logging.error
+    uri = _TOKEN_QS_RE.sub(r"\1[redacted]", handler.request.uri)
+    summary = "%s %s (%s)" % (handler.request.method, uri, handler.request.remote_ip)
+    log_method("%d %s %.2fms", status, summary,
+               1000.0 * handler.request.request_time())
 
 
 def make_session_id():
@@ -108,13 +145,34 @@ def _clear_auth_failures(handler):
 
 
 async def _throttle_auth_failure(handler):
-    """Slow down repeated authentication failures from the same client."""
+    """Slow down repeated authentication failures from the same client.
+
+    Entries expire after AUTH_FAIL_TTL seconds of quiet so the table
+    neither grows forever nor penalises a client indefinitely for a
+    handful of old typos.
+    """
     ip = handler.request.remote_ip
-    count, _ = _auth_failures.get(ip, (0, 0))
+    now = time.time()
+    if len(_auth_failures) > AUTH_FAIL_MAX_IPS:
+        for stale_ip, (_, ts) in list(_auth_failures.items()):
+            if now - ts > AUTH_FAIL_TTL:
+                _auth_failures.pop(stale_ip, None)
+    count, last = _auth_failures.get(ip, (0, 0))
+    if now - last > AUTH_FAIL_TTL:
+        count = 0
     count += 1
-    _auth_failures[ip] = (count, time.time())
+    _auth_failures[ip] = (count, now)
     if count > 3:
         await asyncio.sleep(min(2 ** (count - 3), 30))
+
+
+def _set_auth_cookie(handler):
+    """Issue the auth cookie; Secure only when the request arrived over HTTPS
+    (e.g. behind a TLS-terminating proxy, which requires XHEADERS=1)."""
+    handler.set_cookie(
+        AUTH_COOKIE, COOKIE_SECRET, httponly=True, samesite="Lax",
+        max_age=COOKIE_MAX_AGE, secure=(handler.request.protocol == "https"),
+    )
 
 
 def _preexec_setup_pty():
@@ -176,6 +234,16 @@ class Session:
             env=env,
         )
 
+        # Writes go through a dedicated thread with a FIFO queue: ptyprocess
+        # writes with blocking os.write(), and a child that stops reading its
+        # input would otherwise stall the whole IOLoop for every session.
+        # The queue is bounded — a real PTY input buffer is ~4KB anyway, so
+        # dropping input under sustained backpressure matches tty semantics
+        # while keeping memory bounded.
+        self._write_queue = queue.Queue(maxsize=1024)
+        self._writer_thread = threading.Thread(target=self._writer, daemon=True)
+        self._writer_thread.start()
+
         self._reader_thread = threading.Thread(target=self._reader, daemon=True)
         self._reader_thread.start()
 
@@ -212,6 +280,24 @@ class Session:
             except Exception:
                 pass
 
+    def _writer(self):
+        """Background thread draining the write queue into the PTY.
+
+        Blocking writes are fine here because this thread owns the master
+        fd write side. Exits on the None sentinel from close() or on a
+        write error (the PTY is gone either way).
+        """
+        while True:
+            data = self._write_queue.get()
+            if data is None:
+                return
+            try:
+                self.process.write(data)
+            except Exception:
+                if not self.closed:
+                    logging.exception("[%s] Write error", self.id)
+                return
+
     def _on_pty_data(self, data):
         """Buffer a chunk of PTY output and broadcast it. IOLoop thread only."""
         if self.closed:
@@ -244,10 +330,12 @@ class Session:
             return
         if isinstance(data, str):
             data = data.encode("utf-8")
+        # Enqueue only; the writer thread performs the (blocking) os.write
+        # so input can never stall the IOLoop.
         try:
-            self.process.write(data)
-        except Exception:
-            logging.exception("[%s] Write error", self.id)
+            self._write_queue.put_nowait(data)
+        except queue.Full:
+            logging.warning("[%s] Input queue full, dropping input", self.id)
 
     def resize(self, rows, cols):
         if self.closed or not self.process or not self.process.isalive():
@@ -267,6 +355,15 @@ class Session:
             self.io_loop.add_callback(client.close_after_notify)
         self.clients.clear()
 
+        # Drain pending input and stop the writer thread; nothing that
+        # arrives after close should be written anyway.
+        try:
+            with self._write_queue.mutex:
+                self._write_queue.queue.clear()
+            self._write_queue.put(None)
+        except Exception:
+            pass
+
         # Kill the underlying shell/PTY and close the master fd.
         try:
             if self.process and self.process.isalive():
@@ -285,6 +382,11 @@ class Session:
 
 class TerminalWSHandler(tornado.websocket.WebSocketHandler):
     session = None
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._pending_bytes = 0
+        self._dropped = False
 
     async def open(self):
         if not _check_token(self):
@@ -334,7 +436,17 @@ class TerminalWSHandler(tornado.websocket.WebSocketHandler):
                 rows = TERMINAL_ROWS
             if not 1 <= cols <= 1000:
                 cols = TERMINAL_COLS
-            sessions[sid] = Session(sid, IOLoop.current(), shell=SHELL, cwd=CWD, term=term, colorterm=colorterm, rows=rows, cols=cols)
+            try:
+                sessions[sid] = Session(sid, IOLoop.current(), shell=SHELL, cwd=CWD, term=term, colorterm=colorterm, rows=rows, cols=cols)
+            except Exception:
+                sessions.pop(sid, None)
+                logging.exception("[%s] Failed to spawn session", sid)
+                try:
+                    await self.write_message(json.dumps({"type": "error", "message": "failed to spawn session"}), binary=False)
+                except Exception:
+                    pass
+                self.close()
+                return
 
         self.session_id = sid
         self.session = sessions[sid]
@@ -377,18 +489,40 @@ class TerminalWSHandler(tornado.websocket.WebSocketHandler):
             self.session = None
 
     def _send(self, data, binary=True):
-        """Write a message, swallowing both sync and async socket errors."""
+        """Write a message, swallowing both sync and async socket errors.
+
+        Tracks buffered-but-unwritten bytes and drops the client once it
+        exceeds MAX_WS_PENDING_BYTES: a peer that stops reading would
+        otherwise let PTY output pile up in memory indefinitely.
+        """
+        if self._dropped:
+            return
+        size = len(data) if isinstance(data, (bytes, bytearray, memoryview)) else len(data.encode("utf-8"))
+        if MAX_WS_PENDING_BYTES and self._pending_bytes + size > MAX_WS_PENDING_BYTES:
+            self._dropped = True
+            logging.warning("[%s] Client %d bytes behind, dropping connection",
+                            getattr(self, "session_id", "?"), self._pending_bytes + size)
+            self.close()
+            return
+        self._pending_bytes += size
         try:
             future = self.write_message(data, binary=binary)
         except (tornado.websocket.WebSocketClosedError, StreamClosedError):
+            self._pending_bytes -= size
             return
         except Exception:
+            self._pending_bytes -= size
             logging.exception("[%s] Write error", getattr(self, "session_id", "?"))
             return
         if future is not None:
-            future.add_done_callback(self._send_done)
+            future.add_done_callback(lambda f, s=size: self._send_done(f, s))
+        else:
+            self._pending_bytes -= size
 
-    def _send_done(self, future):
+    def _send_done(self, future, size=0):
+        self._pending_bytes -= size
+        if self._pending_bytes < 0:
+            self._pending_bytes = 0
         # Retrieve async write failures so asyncio does not report them as
         # "Task exception was never retrieved" when a peer vanishes mid-write.
         try:
@@ -429,17 +563,31 @@ class MainHandler(tornado.web.RequestHandler):
         # Upgrade a valid ?token= URL to the auth cookie so the frontend can
         # strip the token from the address bar and keep it out of history.
         if TOKEN and self.get_argument("token", default=None):
-            self.set_cookie(AUTH_COOKIE, COOKIE_SECRET, httponly=True,
-                            samesite="Lax", max_age=COOKIE_MAX_AGE)
+            _set_auth_cookie(self)
 
         self.set_header("Content-Type", "text/html")
+        html = _index_html()
+        if html is None:
+            self.set_status(404)
+            self.finish("index.html not found")
+            return
+        self.write(html)
+
+
+_index_html_cache = None
+
+
+def _index_html():
+    """index.html contents, cached after the first successful read."""
+    global _index_html_cache
+    if _index_html_cache is None:
         html_path = os.path.join(os.path.dirname(__file__), "index.html")
         try:
             with open(html_path, "rb") as f:
-                self.write(f.read())
+                _index_html_cache = f.read()
         except FileNotFoundError:
-            self.set_status(404)
-            self.finish("index.html not found")
+            return None
+    return _index_html_cache
 
 
 class ApiSessionsHandler(tornado.web.RequestHandler):
@@ -542,8 +690,7 @@ class LoginHandler(tornado.web.RequestHandler):
         password = self.get_body_argument("password", default="")
         if _hmac_eq(password, TOKEN):
             _clear_auth_failures(self)
-            self.set_cookie(AUTH_COOKIE, COOKIE_SECRET, httponly=True,
-                            samesite="Lax", max_age=COOKIE_MAX_AGE)
+            _set_auth_cookie(self)
             self.redirect("/")
             return
         await _throttle_auth_failure(self)
@@ -561,8 +708,17 @@ class LogoutHandler(tornado.web.RequestHandler):
 class AuthStaticFileHandler(tornado.web.StaticFileHandler):
     """Static files are behind auth as well when TOKEN is configured."""
 
+    def set_extra_headers(self, path):
+        # Small local assets — force revalidation so a browser never runs a
+        # stale app.js after a server upgrade (304s are cheap on localhost).
+        self.set_header("Cache-Control", "no-cache")
+
     async def get(self, path, include_body=True):
         if not _check_token(self):
+            # Keep the same brute-force throttling as every other endpoint;
+            # without it /static would be an unthrottled guessing oracle.
+            if _presented_credential(self):
+                await _throttle_auth_failure(self)
             self.set_status(403)
             self.set_header("Content-Type", "application/json")
             self.finish(json.dumps({"error": "invalid or missing token"}))
@@ -583,6 +739,7 @@ def make_app():
             (r"/static/(.*)", AuthStaticFileHandler, {"path": static_path}),
         ],
         debug=False,
+        log_function=_log_request,
     )
 
 
@@ -592,8 +749,13 @@ if __name__ == "__main__":
         format="%(asctime)s %(levelname)s: %(message)s",
     )
     app = make_app()
-    app.listen(PORT, address=HOST)
+    server = tornado.httpserver.HTTPServer(app, xheaders=XHEADERS)
+    server.listen(PORT, address=HOST)
     logging.info("Web terminal listening on http://%s:%s", HOST, PORT)
+    if HOST not in ("127.0.0.1", "::1", "localhost") and not TOKEN:
+        logging.warning(
+            "Listening on %s with TOKEN unset — anyone who can reach this "
+            "port gets a shell as this user. Set TOKEN or bind to loopback.", HOST)
 
     def shutdown():
         logging.info("Shutting down...")

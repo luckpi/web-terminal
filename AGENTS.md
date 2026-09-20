@@ -8,7 +8,7 @@ This is a self-contained Python/Tornado web terminal.
 - Run tests: `python3 test_client.py`
 - Server URL: `http://127.0.0.1:8765/`
 - WebSocket endpoint: `ws://127.0.0.1:8765/ws?session=<id>`
-- Authentication: `TOKEN` env is the login password. Browsers authenticate via `GET/POST /login` which sets an `HttpOnly`+`SameSite=Lax` cookie (30 days); `?token=`/`X-Token` remain as fallbacks for scripts. `GET /logout` clears the cookie. All endpoints incl. `/static/*` require auth when TOKEN is set. Failed attempts are throttled per-IP (exponential backoff after 3 failures).
+- Authentication: `TOKEN` env is the login password. Browsers authenticate via `GET/POST /login` which sets an `HttpOnly`+`SameSite=Lax` cookie (30 days, invalidated on server restart because the cookie secret is random per boot); `?token=`/`X-Token` remain as fallbacks for scripts (prefer `X-Token` — `?token=` is redacted in logs but still avoidable). `GET /logout` clears the cookie. All endpoints incl. `/static/*` require auth when TOKEN is set. Failed attempts are throttled per-IP on every endpoint (exponential backoff after 3 failures, counts expire after 1h of quiet).
 - When running tests with auth enabled: `TOKEN=<password> python3 test_client.py`.
 - Session management API: `GET /api/sessions`, `DELETE /api/sessions/<id>`.
 
@@ -35,8 +35,9 @@ No additional packages are required.
 
 ## Architecture
 
-- `server.py`: Tornado HTTP + WebSocket server; manages `Session` objects, each wrapping a `PtyProcess`.
-- `index.html`: Browser terminal UI using xterm.js (loaded from local `static/`).
+- `server.py`: Tornado HTTP + WebSocket server; manages `Session` objects, each wrapping a `PtyProcess`. PTY input goes through a per-session writer thread so a child that stops reading cannot stall the IOLoop; each client is dropped if >`MAX_WS_PENDING` (8 MB) of unwritten output piles up.
+- `index.html`: Browser terminal UI shell using xterm.js (loaded from local `static/`).
+- `static/app.js`: all frontend logic (tabs, settings, i18n, touch scrolling). xterm instances are created lazily per tab via `ensureTerm()` — `tab.term`/`fitAddon`/`searchAddon` are null until the tab is first activated.
 - `test_client.py`: Async functional tests using `tornado.websocket.websocket_connect`.
 
 ## Notes
@@ -47,10 +48,11 @@ No additional packages are required.
 - The server binds to `127.0.0.1:8765` by default; set `HOST`/`PORT` env vars to change.
 - Child shells are spawned with `TERM=xterm-256color` and `COLORTERM=truecolor` by default. Override with `WEB_TERMINAL_TERM` and `WEB_TERMINAL_COLORTERM`.
 - Default PTY dimensions are 80 columns x 24 rows (`TERMINAL_COLS` / `TERMINAL_ROWS`). The browser frontend resizes the PTY automatically when the container changes size.
-- `MAX_SESSIONS` (default `0`, unlimited) can cap the number of concurrent sessions.
+- `MAX_SESSIONS` (default `32`, `0` = unlimited) caps the number of concurrent sessions.
+- `XHEADERS=1` makes the server honor `X-Real-Ip`/`X-Forwarded-For` (behind a trusted reverse proxy only).
 - `index.html` is served with `Cache-Control: no-store`.
 - xterm.js, xterm-addon-fit, and xterm-addon-search are served from `static/` for offline use and SRI has been removed for local files.
-- Shortcuts: `Ctrl+Shift+T` new tab, `Ctrl+Shift+W` close tab, `Ctrl+Shift+F` search, `F3`/`Shift+F3` next/previous.
+- Shortcuts: `Alt+N` new tab, `Alt+W` close tab, `Ctrl+Shift+F` search, `F3`/`Shift+F3` next/previous. `Ctrl+Shift+T`/`Ctrl+Shift+W` are kept as a fallback but browsers reserve them (page never sees the event).
 - Double-click a tab title to rename it.
 - Mobile devices get a compact `body.mobile` style and a bottom shortcut bar with modifier keys (Ctrl/Alt/Shift arm once for the next input) plus Esc, Tab, arrows, Home/End/PgUp/PgDn and hard-to-type symbols.
 - Mobile and desktop settings are stored separately in `localStorage` based on `pointer: coarse` detection.
