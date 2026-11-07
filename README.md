@@ -1,6 +1,6 @@
 # Web Terminal
 
-一个基于真实 PTY 的 Web 终端，页面关闭后终端进程仍然保留，只有点击「Close Terminal」才会真正结束终端。
+一个基于真实 PTY 的 Web 终端，页面关闭后终端进程仍然保留，点击标签上的「终止会话」并确认后才会真正结束终端。
 
 ## 功能
 
@@ -8,7 +8,7 @@
 - 前端使用 `xterm.js`，支持 VT100/ANSI 转义、颜色、光标、resize 等，与本地终端体验接近。
 - 关闭浏览器标签页只会断开 WebSocket，后端的 shell 进程继续运行。
 - 用相同的 `?session=<id>` 重新打开页面即可恢复到同一个终端会话。
-- 点击「Close Terminal」按钮向服务端发送 `close` 消息，真正终止该 PTY 及其子进程。
+- 点击标签上的「终止会话」并确认后，通过 HTTP API 终止该 PTY 及其子进程；请求失败会保留标签并提示重试。
 
 ## 运行环境
 
@@ -47,10 +47,12 @@ python3 server.py
 - 每个标签页有一个独立的 `session id`，显示在工具栏。
 - 复制当前 URL 到另一个浏览器标签页，可以同时连接同一个终端。
 - 关闭页面后，终端仍在后台运行；重新打开相同 URL 即可恢复。
-- 点击「Close Terminal」会结束该会话的 shell 进程。
+- 点击标签上的 × 会先确认，再结束该会话的 shell 进程。右上角「⋯」菜单提供「终止所有会话」，同样需要确认。
+- 底部状态栏显示连接状态与终端尺寸；断线后可以立即重连，输入 `exit` 后可以从状态栏新建终端，原标签保留输出供查看。
+- 右键粘贴使用 xterm 的粘贴接口，遵循终端应用启用的 bracketed paste 模式；这不替代对粘贴内容的检查。
 - 双击标签页标题可重命名。
 - 快捷键：`Alt+N` 新建终端，`Alt+W` 关闭当前终端，`Ctrl+Shift+F` 搜索终端缓冲，`F3` / `Shift+F3` 查找下一个/上一个。（`Ctrl+Shift+T`/`Ctrl+Shift+W` 在 Chrome/Firefox 中被浏览器保留，页面收不到，故用 Alt 组合；这两个键仍保留为 PWA 等场景下的兼容入口。）
-- 手机端自适应：触控设备会自动切换为 `mobile` 样式，按钮和标签更紧凑，底部增加常用快捷键栏（Ctrl+C、Esc、方向键、Tab、|、~ 等）。
+- 手机端自适应：触控设备会自动切换为 `mobile` 样式，按钮和标签更紧凑，底部增加常用快捷键栏（Esc、Tab、Ctrl+C、方向键等；Ctrl/Alt/Shift 支持组合并在下一次输入后复位）。
 - 手机与电脑配置独立保存（基于触控检测使用不同的 `localStorage` 键）。
 - 所有 xterm.js、xterm-addon-fit、xterm-addon-search 资源都托管在本地 `static/`，无需联网即可使用。
 
@@ -61,7 +63,23 @@ cd /home/gumy/桌面/web-terminal
 TOKEN=<服务口令> python3 test_client.py   # 服务启用 TOKEN 时需要
 ```
 
-测试用例覆盖：基本输入输出、断开后进程保留、点击关闭后端 PTY 被终止。
+服务端测试覆盖：基本输入输出、断开后进程保留、关闭会话、尺寸调整、会话 API 与认证拒绝。
+
+浏览器回归测试会自行启动独立的本地测试服务（随机端口），不会连接正在运行的服务：
+
+```bash
+pip3 install -r requirements-dev.txt
+python3 -m playwright install chromium
+python3 test_browser.py
+```
+
+如已安装 Chromium，可指定路径，省略浏览器下载步骤：
+
+```bash
+CHROMIUM_PATH=/usr/bin/chromium python3 test_browser.py
+```
+
+浏览器测试覆盖中文密码、会话上限提示、重连尺寸同步、bracketed paste、会话结束后的恢复入口、终止确认与失败保留、手机组合键和触控区、设置面板焦点及固定操作栏。手机测试使用触控模拟，软键盘与 iOS Safari 仍需真机验证。
 
 ## 安全提示
 
@@ -74,5 +92,5 @@ TOKEN=<服务口令> python3 test_client.py   # 服务启用 TOKEN 时需要
 ## 已知限制
 
 - 服务端重启后所有会话会丢失。如需跨服务端重启保持会话，可改用 `tmux`/`screen` 作为中间层。
-- 「Close Terminal」会结束 shell 及其会话内的进程（与真实终端挂断语义一致）；但 `nohup`、`setsid` 或自行脱离会话的守护进程会存活，与关闭本地终端窗口的行为相同。
+- 「终止会话」会结束 shell 及其会话内的进程（与真实终端挂断语义一致）；但 `nohup`、`setsid` 或自行脱离会话的守护进程会存活，与关闭本地终端窗口的行为相同。
 - PTY 输入写入走每会话专用线程：即使子 shell 停止读取输入，也不会阻塞其他会话。

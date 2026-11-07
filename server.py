@@ -110,8 +110,8 @@ def make_session_id():
 
 def _hmac_eq(a, b):
     try:
-        return hmac.compare_digest(a, b)
-    except TypeError:
+        return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+    except (TypeError, AttributeError):
         return False
 
 
@@ -451,6 +451,7 @@ class TerminalWSHandler(tornado.websocket.WebSocketHandler):
         self.session_id = sid
         self.session = sessions[sid]
         self.session.add_client(self)
+        self._send(json.dumps({"type": "session_ready"}), binary=False)
         logging.info("[%s] Client connected (total %d)", sid, len(self.session.clients))
 
     def on_message(self, message):

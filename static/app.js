@@ -13,7 +13,7 @@ const i18n = {
   zh: {
     newTerminal: '新建终端',
     closeTerminal: '关闭终端',
-    closeAll: '关闭所有',
+    closeAll: '终止所有会话',
     settings: '设置',
     terminalSettings: '终端设置',
     general: '常规',
@@ -55,14 +55,26 @@ const i18n = {
     cancel: '取消',
     reset: '重置',
     custom: '自定义',
-    close: '关闭终端',
+    close: '终止会话',
     renameTerminal: '重命名终端',
-    search: '搜索'
+    search: '搜索',
+    connecting: '正在连接', connected: '已连接', reconnecting: '正在重连',
+    disconnected: '连接已断开', ended: '会话已结束', error: '连接失败',
+    retry: '立即重连', createAgain: '新建终端', idle: '未选择终端',
+    closeConfirm: '终止会话「{name}」？该会话中的运行任务也会结束。关闭浏览器页面可保留任务。',
+    closeAllConfirm: '终止全部 {count} 个会话？这些会话中的运行任务也会结束。',
+    maxSessions: '会话数量已达上限，请先终止不再使用的会话。',
+    spawnFailed: '无法启动终端，请检查服务端的 shell 与工作目录配置。',
+    invalidSession: '会话 ID 无效，请新建终端。', unknownError: '服务器拒绝了连接，请重试。',
+    closeFailed: '终止失败，会话仍保留在列表中，请重试。',
+    loadFailed: '无法加载会话列表，请检查网络后重试。', reload: '重新加载',
+    clipboardFailed: '无法访问剪贴板，请检查浏览器权限或使用系统粘贴。',
+    attempt: '第 {count} 次', dimensions: '{cols} 列 × {rows} 行'
   },
   en: {
     newTerminal: 'New Terminal',
     closeTerminal: 'Close Terminal',
-    closeAll: 'Close All',
+    closeAll: 'Terminate all sessions',
     settings: 'Settings',
     terminalSettings: 'Terminal Settings',
     general: 'General',
@@ -104,9 +116,21 @@ const i18n = {
     cancel: 'Cancel',
     reset: 'Reset',
     custom: 'Custom',
-    close: 'Close terminal',
+    close: 'Terminate session',
     renameTerminal: 'Rename terminal',
-    search: 'Search'
+    search: 'Search',
+    connecting: 'Connecting', connected: 'Connected', reconnecting: 'Reconnecting',
+    disconnected: 'Disconnected', ended: 'Session ended', error: 'Connection failed',
+    retry: 'Reconnect now', createAgain: 'New terminal', idle: 'No terminal selected',
+    closeConfirm: 'Terminate “{name}”? Running tasks in this session will also end. Close the browser page to keep tasks running.',
+    closeAllConfirm: 'Terminate all {count} sessions? Running tasks in these sessions will also end.',
+    maxSessions: 'Session limit reached. Terminate an unused session first.',
+    spawnFailed: 'Unable to start terminal. Check the server shell and working directory.',
+    invalidSession: 'Invalid session ID. Create a new terminal.', unknownError: 'The server rejected the connection. Please retry.',
+    closeFailed: 'Termination failed. The session remains listed; please retry.',
+    loadFailed: 'Unable to load sessions. Check your connection and retry.', reload: 'Reload',
+    clipboardFailed: 'Clipboard unavailable. Check browser permissions or use system paste.',
+    attempt: 'Attempt {count}', dimensions: '{cols} cols × {rows} rows'
   }
 };
 
@@ -123,10 +147,11 @@ function updateI18n() {
   });
   const settingsBtn = document.getElementById('settings-btn');
   if (settingsBtn) settingsBtn.textContent = t('settings');
-  if (plusEl) plusEl.title = t('newTerminal');
+  if (plusEl) { plusEl.title = t('newTerminal'); plusEl.setAttribute('aria-label', t('newTerminal')); }
+  renderStatus();
   tabs.forEach(tab => {
     const close = tab.tabEl.querySelector('.close');
-    if (close) close.title = t('close');
+    if (close) { close.title = t('close'); close.setAttribute('aria-label', t('close')); }
   });
 }
 
@@ -320,19 +345,21 @@ async function pasteFromClipboard() {
       const text = await navigator.clipboard.readText();
       if (text) {
         const tab = tabs.find(t => t.id === activeTabId);
-        if (tab && tab.ws && tab.ws.readyState === WebSocket.OPEN) {
-          tab.ws.send(JSON.stringify({ type: 'input', data: text }));
+        if (tab && tab.term && tab.ws && tab.ws.readyState === WebSocket.OPEN) {
+          tab.term.paste(text);
+          tab.term.focus();
         }
       }
     } catch (e) {
-      console.warn('paste failed', e);
+      showNotice('clipboardFailed');
     }
   } else {
-    console.warn('right-click paste requires HTTPS or clipboard permission');
+    showNotice('clipboardFailed');
   }
 }
 
-const plusEl = document.createElement('div');
+const plusEl = document.createElement('button');
+plusEl.type = 'button';
 plusEl.className = 'tab-add';
 plusEl.title = t('newTerminal');
 plusEl.textContent = '+';
@@ -406,9 +433,68 @@ function updateEmptyState() {
   const empty = document.getElementById('empty-state');
   if (!empty) return;
   empty.classList.toggle('visible', tabs.length === 0);
+  renderStatus();
+}
+
+let loadError = false;
+let noticeTimer = null;
+
+function showNotice(key) {
+  const notice = document.getElementById('notice');
+  clearTimeout(noticeTimer);
+  notice.textContent = t(key);
+  notice.hidden = false;
+  noticeTimer = setTimeout(() => { notice.hidden = true; }, 6000);
+}
+
+function setConnectionState(tab, state, errorKey = '') {
+  tab.state = state;
+  tab.errorKey = errorKey;
+  tab.tabEl.dataset.state = state;
+  tab.tabEl.title = t(errorKey || state);
+  renderStatus();
+}
+
+function renderStatus() {
+  const bar = document.getElementById('connection-status');
+  if (!bar) return;
+  const tab = tabs.find(t => t.id === activeTabId);
+  const state = tab ? tab.state : (loadError ? 'error' : 'idle');
+  bar.dataset.state = state;
+  const parts = [t(tab && tab.errorKey ? tab.errorKey : (loadError && !tab ? 'loadFailed' : state))];
+  if (tab && state === 'reconnecting') parts.push(t('attempt').replace('{count}', tab.reconnectAttempts || 1));
+  if (tab && tab.term && state === 'connected') {
+    parts.push(t('dimensions').replace('{cols}', tab.term.cols).replace('{rows}', tab.term.rows));
+  }
+  document.getElementById('connection-text').textContent = parts.join(' · ');
+  const retry = document.getElementById('reconnect-btn');
+  retry.hidden = !(['disconnected', 'reconnecting', 'ended', 'error'].includes(state));
+  retry.textContent = t(!tab && loadError ? 'reload' : (state === 'ended' || (tab && tab.errorKey === 'invalidSession') ? 'createAgain' : 'retry'));
+  retry.disabled = !!(tab && tab.closing);
+  document.getElementById('close-all-btn').disabled = tabs.length === 0 || closingAll;
+  // A wrapped error message or retry button can change the terminal's available height.
+  if (tab && currentSettings.autoFit) applyTabSize(tab);
+}
+
+function retryActiveConnection() {
+  const tab = tabs.find(t => t.id === activeTabId);
+  if (!tab) { if (loadError) location.reload(); return; }
+  if (tab.state === 'ended' || tab.errorKey === 'invalidSession') newTerminal();
+  else reconnectTab(tab);
+}
+
+function syncTerminalSize(tab) {
+  if (tab.term && tab.ws && tab.ws.readyState === WebSocket.OPEN) {
+    tab.ws.send(JSON.stringify({ type: 'resize', cols: tab.term.cols, rows: tab.term.rows }));
+  }
+  renderStatus();
 }
 
 function reconnectTab(tab) {
+  if (tab.closing) return;
+  tab.reconnectAttempts = (tab.reconnectAttempts || 0) + 1;
+  setConnectionState(tab, tab.hasConnected || tab.reconnectAttempts > 1 ? 'reconnecting' : 'connecting');
+
   if (tab.reconnectTimer) {
     clearTimeout(tab.reconnectTimer);
     tab.reconnectTimer = null;
@@ -435,11 +521,11 @@ function reconnectTab(tab) {
       if (tab.ws && tab.ws.readyState <= WebSocket.OPEN) tab.ws.close();
       return;
     }
-    if (tab.tabEl && tab.tabEl.isConnected) tab.tabEl.style.opacity = '1';
     if (tab.id === activeTabId) {
       ensureTerm(tab);
       applyTabSize(tab);
-      tab.term.focus();
+      syncTerminalSize(tab);
+      if (!document.getElementById('settings-modal').classList.contains('active')) tab.term.focus();
     }
   };
 
@@ -447,7 +533,17 @@ function reconnectTab(tab) {
     if (typeof e.data === 'string') {
       try {
         const msg = JSON.parse(e.data);
+        if (msg.type === 'session_ready') {
+          tab.reconnectAttempts = 0;
+          tab.hasConnected = true;
+          setConnectionState(tab, 'connected');
+          if (tab.id === activeTabId) syncTerminalSize(tab);
+        }
         if (msg.type === 'session_closed' || msg.type === 'error') {
+          const errors = { 'max sessions reached': 'maxSessions', 'failed to spawn session': 'spawnFailed', 'invalid session id': 'invalidSession' };
+          setConnectionState(tab, msg.type === 'session_closed' ? 'ended' : 'error',
+            msg.type === 'error' ? (errors[msg.message] || 'unknownError') : '');
+          if (tab.keepaliveTimer) clearInterval(tab.keepaliveTimer);
           tab.intentionalClose = true;
           if (tab.ws && (tab.ws.readyState === WebSocket.OPEN || tab.ws.readyState === WebSocket.CONNECTING)) {
             tab.ws.close();
@@ -474,16 +570,18 @@ function reconnectTab(tab) {
   };
 
   ws.onclose = () => {
-    if (tab.tabEl && tab.tabEl.isConnected) tab.tabEl.style.opacity = '0.6';
-    if (tab.intentionalClose) return;
+    if (tab.keepaliveTimer) clearInterval(tab.keepaliveTimer);
+    if (tab.intentionalClose || tab.closing) return;
+    setConnectionState(tab, 'disconnected');
     if (tab.reconnectTimer) clearTimeout(tab.reconnectTimer);
     if (currentSettings.autoReconnect && currentSettings.reconnectInterval > 0) {
+      setConnectionState(tab, 'reconnecting');
       tab.reconnectTimer = setTimeout(() => reconnectTab(tab), currentSettings.reconnectInterval);
     }
   };
 
   ws.onerror = () => {
-    if (tab.tabEl && tab.tabEl.isConnected) tab.tabEl.style.opacity = '0.6';
+    if (!tab.intentionalClose && !tab.closing) setConnectionState(tab, 'disconnected');
   };
 
   setupKeepalive(tab);
@@ -670,39 +768,7 @@ function ensureTerm(tab) {
     if (data.startsWith('\x1b]10;') || data.startsWith('\x1b]11;') || data.startsWith('\x1b]12;')) {
       return;
     }
-    if (ctrlArmed) {
-      let out = data;
-      if (data.length === 1) {
-        const code = data.charCodeAt(0);
-        if (code >= 97 && code <= 122) out = String.fromCharCode(code - 96);       // a-z
-        else if (code >= 65 && code <= 90) out = String.fromCharCode(code - 64);    // A-Z
-        else if (code >= 49 && code <= 57) out = String.fromCharCode(code - 48);    // 1-9
-      }
-      ctrlArmed = false;
-      updateModifierButtons();
-      tab.ws.send(JSON.stringify({ type: 'input', data: out }));
-      return;
-    }
-    if (altArmed) {
-      const out = data.length === 1 ? ('\x1b' + data) : data;
-      altArmed = false;
-      updateModifierButtons();
-      tab.ws.send(JSON.stringify({ type: 'input', data: out }));
-      return;
-    }
-    if (shiftArmed) {
-      const shiftMap = { '1': '!', '2': '@', '3': '#', '4': '$', '5': '%', '6': '^', '7': '&', '8': '*', '9': '(', '0': ')', '-': '_', '=': '+', '[': '{', ']': '}', '\\': '|', ';': ':', "'": '"', ',': '<', '.': '>', '/': '?', '`': '~' };
-      let out = data;
-      if (data.length === 1) {
-        if (shiftMap[data]) out = shiftMap[data];
-        else out = data.toUpperCase();
-      }
-      shiftArmed = false;
-      updateModifierButtons();
-      tab.ws.send(JSON.stringify({ type: 'input', data: out }));
-      return;
-    }
-    tab.ws.send(JSON.stringify({ type: 'input', data }));
+    sendTerminalInput(tab, data);
   });
 
   term.onResize(({ cols, rows }) => {
@@ -712,6 +778,7 @@ function ensureTerm(tab) {
     tab.resizeTimer = setTimeout(() => {
       if (tab.ws && tab.ws.readyState === WebSocket.OPEN) {
         tab.ws.send(JSON.stringify({ type: 'resize', cols, rows }));
+        renderStatus();
       }
     }, 100);
   });
@@ -748,10 +815,19 @@ function createTab(sessionId, active = false) {
 
   const tabEl = document.createElement('div');
   tabEl.className = 'tab' + (active ? ' active' : '');
+  tabEl.setAttribute('role', 'tab');
+  tabEl.tabIndex = 0;
+  tabEl.onkeydown = e => {
+    if (e.target === tabEl && (e.key === 'Enter' || e.key === ' ')) {
+      e.preventDefault(); switchTab(sessionId);
+    }
+  };
   const titleEl = document.createElement('span');
   titleEl.className = 'title';
   titleEl.textContent = getTabTitle(sessionId);
-  const closeEl = document.createElement('span');
+  const closeEl = document.createElement('button');
+  closeEl.type = 'button';
+  closeEl.setAttribute('aria-label', t('close'));
   closeEl.className = 'close';
   closeEl.title = t('close');
   closeEl.textContent = '×';
@@ -772,7 +848,7 @@ function createTab(sessionId, active = false) {
   container.className = 'term-container' + (active ? ' active' : '');
   terminalArea.appendChild(container);
 
-  const tab = { id: sessionId, sessionId, tabEl, container, term: null, fitAddon: null, searchAddon: null, searchTerm: '', ws: null, initialSync: true, intentionalClose: false, resizeTimer: null, copyTimer: null, title: getTabTitle(sessionId), cancelInertia: null };
+  const tab = { state: 'disconnected', reconnectAttempts: 0, id: sessionId, sessionId, tabEl, container, term: null, fitAddon: null, searchAddon: null, searchTerm: '', ws: null, initialSync: true, intentionalClose: false, resizeTimer: null, copyTimer: null, title: getTabTitle(sessionId), cancelInertia: null };
   tabs.push(tab);
 
   titleEl.addEventListener('dblclick', (e) => {
@@ -798,6 +874,7 @@ function switchTab(sessionId) {
   for (const t of tabs) {
     const isActive = t.id === sessionId;
     t.tabEl.classList.toggle('active', isActive);
+    t.tabEl.setAttribute('aria-selected', String(isActive));
     t.container.classList.toggle('active', isActive);
   }
   activeTabId = sessionId;
@@ -812,6 +889,8 @@ function switchTab(sessionId) {
     tab.term.focus();
   }
   updateUrl(sessionId);
+  if (tab) tab.tabEl.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  renderStatus();
 }
 
 function startInlineRename(titleEl, tab) {
@@ -854,67 +933,62 @@ function startInlineRename(titleEl, tab) {
   titleEl.addEventListener('keydown', onKeydown);
 }
 
-function closeSession(sessionId) {
+let closingAll = false;
+
+async function closeSession(sessionId) {
   const url = appendToken(`/api/sessions/${encodeURIComponent(sessionId)}`);
-  return fetch(url, { method: 'DELETE' })
-    .catch(err => console.warn('close session failed', err));
+  const resp = await fetch(url, { method: 'DELETE' });
+  if (!resp.ok && resp.status !== 404) throw new Error(`HTTP ${resp.status}`);
 }
 
-function closeTab(sessionId) {
-  const idx = tabs.findIndex(t => t.id === sessionId);
-  if (idx === -1) return;
-  const tab = tabs[idx];
-
+async function closeTab(sessionId, confirmed = false) {
+  const tab = tabs.find(t => t.id === sessionId);
+  if (!tab || tab.closing) return;
+  if (!confirmed && tab.state !== 'ended' && !confirm(t('closeConfirm').replace('{name}', tab.title))) return;
+  tab.closing = true;
+  if (tab.reconnectTimer) clearTimeout(tab.reconnectTimer);
+  // Cancel an in-flight handshake before deleting; it must not create a new PTY afterwards.
+  if (tab.ws && tab.ws.readyState === WebSocket.CONNECTING) tab.ws.close();
+  renderStatus();
+  try {
+    await closeSession(sessionId);
+  } catch (err) {
+    tab.closing = false;
+    showNotice('closeFailed');
+    renderStatus();
+    return;
+  }
   tab.intentionalClose = true;
   if (tab.keepaliveTimer) clearInterval(tab.keepaliveTimer);
-  if (tab.reconnectTimer) clearTimeout(tab.reconnectTimer);
   if (tab.resizeTimer) clearTimeout(tab.resizeTimer);
   if (tab.copyTimer) clearTimeout(tab.copyTimer);
-
-  if (tab.ws) {
-    if (tab.ws.readyState === WebSocket.OPEN) {
-      tab.ws.send(JSON.stringify({ type: 'close' }));
-    }
-    if (tab.ws.readyState <= WebSocket.OPEN) {
-      tab.ws.close();
-    }
-  }
-
-  // Also use the HTTP endpoint to guarantee the session is removed,
-  // especially when the WebSocket was not yet established or already gone.
-  closeSession(sessionId);
-
+  if (tab.ws) tab.ws.close();
   if (tab.cancelInertia) tab.cancelInertia();
-  if (tab.term) {
-    tab.term.dispose();
-    tab.term = null;
-  }
+  if (tab.term) tab.term.dispose();
   tab.tabEl.remove();
   tab.container.remove();
-  tabs.splice(idx, 1);
+  tabs.splice(tabs.indexOf(tab), 1);
   delete savedTitles[sessionId];
   saveSavedTitles();
-
   if (activeTabId === sessionId) {
-    if (tabs.length) {
-      switchTab(tabs[0].id);
-    } else {
-      activeTabId = null;
-      clearSessionFromUrl();
-    }
+    if (tabs.length) switchTab(tabs[0].id);
+    else { activeTabId = null; clearSessionFromUrl(); }
   }
   updateEmptyState();
+  renderStatus();
 }
 
-function closeAllTabs() {
-  if (!tabs.length) return;
-  activeTabId = null;
-  clearSessionFromUrl();
-  // Close from the end to keep array index simple
-  for (let i = tabs.length - 1; i >= 0; i--) {
-    closeTab(tabs[i].id);
+async function closeAllTabs() {
+  if (!tabs.length || closingAll) return;
+  if (!confirm(t('closeAllConfirm').replace('{count}', tabs.length))) return;
+  closingAll = true;
+  renderStatus();
+  try {
+    for (const tab of [...tabs].reverse()) await closeTab(tab.id, true);
+  } finally {
+    closingAll = false;
+    renderStatus();
   }
-  updateEmptyState();
 }
 
 function updateLayout() {
@@ -937,32 +1011,60 @@ if (window.visualViewport) {
   });
 }
 
-function sendToActiveTerminal(text) {
-  const tab = tabs.find(t => t.id === activeTabId);
-  if (tab && tab.ws && tab.ws.readyState === WebSocket.OPEN) {
-    tab.ws.send(JSON.stringify({ type: 'input', data: text }));
+function sendTerminalInput(tab, data, literal = false) {
+  if (!tab || !tab.ws || tab.ws.readyState !== WebSocket.OPEN) return;
+  let out = data;
+  if (!literal && (ctrlArmed || altArmed || shiftArmed)) {
+    const modifier = 1 + Number(shiftArmed) + 2 * Number(altArmed) + 4 * Number(ctrlArmed);
+    const cursor = /^\x1b(?:\[|O)([ABCDHF])$/.exec(data);
+    const navigation = /^\x1b\[(\d+)~$/.exec(data);
+    if (cursor) out = `\x1b[1;${modifier}${cursor[1]}`;
+    else if (navigation) out = `\x1b[${navigation[1]};${modifier}~`;
+    else if (data === '\t' && shiftArmed && !ctrlArmed && !altArmed) out = '\x1b[Z';
+    else {
+      if (shiftArmed && data.length === 1) {
+        const shifted = { '1': '!', '2': '@', '3': '#', '4': '$', '5': '%', '6': '^', '7': '&', '8': '*', '9': '(', '0': ')', '-': '_', '=': '+', '[': '{', ']': '}', '\\': '|', ';': ':', "'": '"', ',': '<', '.': '>', '/': '?', '`': '~' };
+        out = shifted[data] || data.toUpperCase();
+      }
+      if (ctrlArmed && out.length === 1) {
+        const code = out.toUpperCase().charCodeAt(0);
+        if (code >= 64 && code <= 95) out = String.fromCharCode(code - 64);
+        else if (out === ' ') out = '\x00';
+        else if (out === '?') out = '\x7f';
+      }
+      if (altArmed) out = '\x1b' + out;
+    }
   }
+  ctrlArmed = altArmed = shiftArmed = false;
+  updateModifierButtons();
+  tab.ws.send(JSON.stringify({ type: 'input', data: out }));
+}
+
+function sendToActiveTerminal(text, literal = false) {
+  const tab = tabs.find(t => t.id === activeTabId);
+  sendTerminalInput(tab, text, literal);
 }
 
 function updateModifierButtons() {
-  if (ctrlBtn) ctrlBtn.classList.toggle('active', ctrlArmed);
-  if (altBtn) altBtn.classList.toggle('active', altArmed);
-  if (shiftBtn) shiftBtn.classList.toggle('active', shiftArmed);
+  if (ctrlBtn) { ctrlBtn.classList.toggle('active', ctrlArmed); ctrlBtn.setAttribute('aria-pressed', String(ctrlArmed)); }
+  if (altBtn) { altBtn.classList.toggle('active', altArmed); altBtn.setAttribute('aria-pressed', String(altArmed)); }
+  if (shiftBtn) { shiftBtn.classList.toggle('active', shiftArmed); shiftBtn.setAttribute('aria-pressed', String(shiftArmed)); }
 }
 
 function renderShortcutBar() {
   const bar = document.getElementById('shortcut-bar');
   if (!bar) return;
   const shortcuts = [
-    { label: 'Ctrl', modifier: 'ctrl' },
-    { label: 'Alt', modifier: 'alt' },
-    { label: 'Shift', modifier: 'shift' },
     { label: 'Esc', text: '\x1B' },
     { label: 'Tab', text: '\t' },
+    { label: 'Ctrl+C', text: '\x03', literal: true },
+    { label: 'Ctrl', modifier: 'ctrl' },
     { label: '←', text: '\x1b[D' },
     { label: '→', text: '\x1b[C' },
     { label: '↑', text: '\x1b[A' },
     { label: '↓', text: '\x1b[B' },
+    { label: 'Alt', modifier: 'alt' },
+    { label: 'Shift', modifier: 'shift' },
     { label: 'Home', text: '\x1b[H' },
     { label: 'End', text: '\x1b[F' },
     { label: 'PgUp', text: '\x1b[5~' },
@@ -978,6 +1080,11 @@ function renderShortcutBar() {
   for (const s of shortcuts) {
     const btn = document.createElement('button');
     btn.textContent = s.label;
+    // Keep the terminal focused and the mobile keyboard open while tapping keys.
+    btn.addEventListener('pointerdown', e => {
+      if (e.pointerType === 'mouse') e.preventDefault();
+    });
+    btn.addEventListener('mousedown', e => e.preventDefault());
     if (s.modifier) {
       btn.dataset.modifier = s.modifier;
       if (s.modifier === 'ctrl') ctrlBtn = btn;
@@ -987,20 +1094,21 @@ function renderShortcutBar() {
         e.preventDefault();
         if (s.modifier === 'ctrl') {
           ctrlArmed = !ctrlArmed;
-          if (ctrlArmed) { altArmed = false; shiftArmed = false; }
         } else if (s.modifier === 'alt') {
           altArmed = !altArmed;
-          if (altArmed) { ctrlArmed = false; shiftArmed = false; }
         } else if (s.modifier === 'shift') {
           shiftArmed = !shiftArmed;
-          if (shiftArmed) { ctrlArmed = false; altArmed = false; }
         }
         updateModifierButtons();
+        const tab = tabs.find(t => t.id === activeTabId);
+        if (tab && tab.term) tab.term.focus();
       });
     } else {
       btn.addEventListener('click', (e) => {
         e.preventDefault();
-        sendToActiveTerminal(s.text);
+        sendToActiveTerminal(s.text, s.literal);
+        const tab = tabs.find(t => t.id === activeTabId);
+        if (tab && tab.term) tab.term.focus();
       });
     }
     bar.appendChild(btn);
@@ -1089,7 +1197,12 @@ function toggleFixedSizeFields() {
   if (fixed) fixed.style.display = autoFit ? 'none' : '';
 }
 
+let settingsReturnFocus = null;
+
 function openSettings() {
+  if (!document.getElementById('settings-modal').classList.contains('active')) {
+    settingsReturnFocus = document.activeElement;
+  }
   populateSelects();
   document.getElementById('setting-language').value = currentSettings.language;
 
@@ -1122,10 +1235,12 @@ function openSettings() {
   document.getElementById('setting-term-cols').value = currentSettings.termCols;
   document.getElementById('setting-term-rows').value = currentSettings.termRows;
   document.getElementById('settings-modal').classList.add('active');
+  document.getElementById('setting-language').focus();
 }
 
 function closeSettings() {
   document.getElementById('settings-modal').classList.remove('active');
+  if (settingsReturnFocus && settingsReturnFocus.isConnected) settingsReturnFocus.focus();
 }
 
 function applySettings() {
@@ -1203,6 +1318,7 @@ async function init() {
       location.href = '/login';
       return;
     }
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const sessList = await resp.json();
     const querySid = getQuerySession();
 
@@ -1219,10 +1335,12 @@ async function init() {
 
     updateI18n();
   } catch (e) {
+    loadError = true;
     console.error('init failed', e);
     updateI18n();
   }
   updateEmptyState();
+  renderStatus();
 }
 
 // Capture phase: xterm consumes (stopPropagation) keys it handles on its
@@ -1230,6 +1348,17 @@ async function init() {
 // focused. Handling at window-capture intercepts before that happens; keys
 // we don't claim must continue propagating to xterm untouched.
 window.addEventListener('keydown', (e) => {
+  const modal = document.getElementById('settings-modal');
+  if (modal.classList.contains('active')) {
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeSettings(); }
+    else if (e.key === 'Tab') {
+      const focusable = [...modal.querySelectorAll('button, input, select')].filter(el => !el.disabled && el.getClientRects().length);
+      const first = focusable[0], last = focusable[focusable.length - 1];
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    }
+    return;
+  }
   if (e.target && e.target.isContentEditable) return;
   const swallow = () => { e.preventDefault(); e.stopPropagation(); };
   if (e.key === 'F3') {

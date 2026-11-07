@@ -5,7 +5,8 @@ This is a self-contained Python/Tornado web terminal.
 ## Commands
 
 - Start server: `python3 server.py`
-- Run tests: `python3 test_client.py`
+- Run server tests: `python3 test_client.py` (requires a running server).
+- Run browser regressions: install `requirements-dev.txt` and Playwright Chromium, then `python3 test_browser.py`; set `CHROMIUM_PATH` to use an existing Chromium. This suite starts its own isolated server.
 - Server URL: `http://127.0.0.1:8765/`
 - WebSocket endpoint: `ws://127.0.0.1:8765/ws?session=<id>`
 - Authentication: `TOKEN` env is the login password. Browsers authenticate via `GET/POST /login` which sets an `HttpOnly`+`SameSite=Lax` cookie (30 days, invalidated on server restart because the cookie secret is random per boot); `?token=`/`X-Token` remain as fallbacks for scripts (prefer `X-Token` — `?token=` is redacted in logs but still avoidable). `GET /logout` clears the cookie. All endpoints incl. `/static/*` require auth when TOKEN is set. Failed attempts are throttled per-IP on every endpoint (exponential backoff after 3 failures, counts expire after 1h of quiet).
@@ -44,7 +45,9 @@ No additional packages are required.
 
 - Each session is keyed by a `session` query parameter.
 - Closing the WebSocket (browser tab close) does **not** terminate the PTY.
-- Sending `{"type":"close"}` over the WebSocket terminates the PTY and removes the session.
+- Sending `{"type":"close"}` over the WebSocket terminates the PTY and removes the session. The browser UI confirms termination, then uses HTTP DELETE and removes the tab only after success (or 404).
+- A `session_ready` WebSocket control message indicates successful session attachment; binary frames carry terminal output. Always synchronize the current frontend dimensions after WebSocket open, even if fit() reports no change.
+- The bottom status bar distinguishes connecting, connected, reconnecting, disconnected, ended and error states; ended tabs retain output and offer creation of a fresh terminal.
 - The server binds to `127.0.0.1:8765` by default; set `HOST`/`PORT` env vars to change.
 - Child shells are spawned with `TERM=xterm-256color` and `COLORTERM=truecolor` by default. Override with `WEB_TERMINAL_TERM` and `WEB_TERMINAL_COLORTERM`.
 - Default PTY dimensions are 80 columns x 24 rows (`TERMINAL_COLS` / `TERMINAL_ROWS`). The browser frontend resizes the PTY automatically when the container changes size.
@@ -54,5 +57,5 @@ No additional packages are required.
 - xterm.js, xterm-addon-fit, and xterm-addon-search are served from `static/` for offline use and SRI has been removed for local files.
 - Shortcuts: `Alt+N` new tab, `Alt+W` close tab, `Ctrl+Shift+F` search, `F3`/`Shift+F3` next/previous. `Ctrl+Shift+T`/`Ctrl+Shift+W` are kept as a fallback but browsers reserve them (page never sees the event).
 - Double-click a tab title to rename it.
-- Mobile devices get a compact `body.mobile` style and a bottom shortcut bar with modifier keys (Ctrl/Alt/Shift arm once for the next input) plus Esc, Tab, arrows, Home/End/PgUp/PgDn and hard-to-type symbols.
+- Mobile devices get a compact `body.mobile` style and a bottom shortcut bar with modifier keys (Ctrl/Alt/Shift can combine and arm once for the next input, including shortcut buttons) plus Esc, Tab, arrows, Home/End/PgUp/PgDn and hard-to-type symbols.
 - Mobile and desktop settings are stored separately in `localStorage` based on `pointer: coarse` detection.
