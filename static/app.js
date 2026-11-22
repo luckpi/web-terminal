@@ -756,6 +756,27 @@ function ensureTerm(tab) {
   term.options.cursorBlink = currentSettings.cursorBlink;
   term.options.cursorStyle = currentSettings.cursorStyle;
 
+  // Android soft keyboards and IMEs deliver text through xterm's hidden
+  // helper textarea, which upstream keeps accumulating (it is only cleared
+  // on Enter/Ctrl+C/blur). xterm's deferred textarea diff can then re-emit
+  // the whole accumulated value, duplicating input (xterm.js #3600/#6045/
+  // #6078). Keep the textarea empty between data emissions, skipping while
+  // a composition is active or while a compositionend finalizer is still
+  // queued to read the pending composition text (the .composition-view
+  // class mirrors xterm's own _isComposing flag).
+  const helperTextarea = term.textarea;
+  let pendingCompositionSend = false;
+  if (helperTextarea) {
+    helperTextarea.addEventListener('compositionend', () => {
+      pendingCompositionSend = true;
+      // xterm's own compositionend listener is registered first, so this
+      // timer is queued after the one that emits the composed text.
+      setTimeout(() => { pendingCompositionSend = false; }, 0);
+    });
+  }
+  const helperTextareaBusy = () => pendingCompositionSend ||
+    !!(term.element && term.element.querySelector('.composition-view.active'));
+
   term.onData((data) => {
     const tab = tabs.find(t => t.id === sessionId);
     if (!tab || !tab.ws || tab.ws.readyState !== WebSocket.OPEN) return;
@@ -769,6 +790,7 @@ function ensureTerm(tab) {
       return;
     }
     sendTerminalInput(tab, data);
+    if (helperTextarea && helperTextarea.value && !helperTextareaBusy()) helperTextarea.value = '';
   });
 
   term.onResize(({ cols, rows }) => {

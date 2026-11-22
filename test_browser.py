@@ -148,6 +148,32 @@ class TerminalBrowserTests(unittest.TestCase):
         }''')
         self.assertEqual(messages, [{'type': 'input', 'data': '\x1b[200~echo one\recho two\r\x1b[201~'}])
 
+    def test_ime_batched_input_not_duplicated(self):
+        self.create_terminal()
+        sent = self.page.evaluate('''async () => {
+          const tab=tabs[0], ta=document.querySelector('.xterm-helper-textarea'), sent=[];
+          const original=tab.ws.send.bind(tab.ws);
+          tab.ws.send=m=>{const p=JSON.parse(m); if(p.type==='input') sent.push(p.data);};
+          ta.focus();
+          const kd=()=>ta.dispatchEvent(new KeyboardEvent('keydown',{keyCode:229,which:229,key:'Unidentified',bubbles:true}));
+          const ku=()=>ta.dispatchEvent(new KeyboardEvent('keyup',{keyCode:229,which:229,key:'Unidentified',bubbles:true}));
+          const inp=d=>ta.dispatchEvent(new InputEvent('input',{data:d,inputType:'insertText',isComposing:false,bubbles:true,composed:true}));
+          // Android delivers each key as keydown(229) + IME textarea write +
+          // input event; batched delivery must still send the text only once.
+          kd(); kd(); ta.value='ls'; inp('l'); inp('ls'); ku(); ku();
+          await new Promise(r=>setTimeout(r,60));
+          // A CJK composition must still deliver the committed text once.
+          ta.value=''; kd();
+          ta.dispatchEvent(new CompositionEvent('compositionstart',{bubbles:true}));
+          ta.value='ni'; ta.dispatchEvent(new CompositionEvent('compositionupdate',{data:'ni',bubbles:true}));
+          ta.value='你'; ta.dispatchEvent(new CompositionEvent('compositionupdate',{data:'你',bubbles:true}));
+          ta.dispatchEvent(new CompositionEvent('compositionend',{data:'你',bubbles:true})); ku();
+          await new Promise(r=>setTimeout(r,60));
+          tab.ws.send=original;
+          return sent;
+        }''')
+        self.assertEqual(sent, ['ls', '你'])
+
     def test_exit_has_recovery_action(self):
         self.create_terminal()
         self.page.evaluate("sendToActiveTerminal('exit\\n')")
