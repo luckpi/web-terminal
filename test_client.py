@@ -5,6 +5,8 @@ import asyncio
 import json
 import os
 import re
+import shlex
+import sys
 
 from tornado.httpclient import AsyncHTTPClient, HTTPRequest
 from tornado.websocket import websocket_connect
@@ -180,6 +182,35 @@ async def test_http_api():
     print("OK\n")
 
 
+async def test_redraw():
+    print("--- test_redraw ---")
+    ws = await websocket_connect(ws_url("/ws?session=test_redraw&rows=24&cols=80"))
+    try:
+        await collect_output(ws, idle_timeout=0.5)
+        source = (
+            "import os,signal,time\n"
+            "def paint(*_):\n"
+            " os.write(1, b'PTY_' + b'REDRAW_COMPLETE\\n')\n"
+            "signal.signal(signal.SIGWINCH, paint)\n"
+            "os.write(1, b'READY\\n')\n"
+            "time.sleep(60)\n"
+        )
+        await ws.write_message(json.dumps({
+            "type": "input",
+            "data": f"{shlex.quote(sys.executable)} -u -c {shlex.quote(source)}\n",
+        }))
+        await collect_output(ws, idle_timeout=0.5)
+        await ws.write_message(json.dumps({
+            "type": "resize", "rows": 24, "cols": 80, "redraw": True,
+        }))
+        out = await collect_output(ws, idle_timeout=0.8)
+        assert b"PTY_REDRAW_COMPLETE" in out, "same-size redraw did not notify the foreground program"
+    finally:
+        await ws.write_message(json.dumps({"type": "close"}))
+        ws.close()
+    print("OK\n")
+
+
 async def test_auth_rejection():
     """Only meaningful when the server runs with TOKEN set."""
     print("--- test_auth_rejection ---")
@@ -217,6 +248,7 @@ async def main():
     await test_persistence()
     await test_close()
     await test_resize()
+    await test_redraw()
     await test_http_api()
     await test_auth_rejection()
     print("All tests passed.")

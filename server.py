@@ -8,6 +8,7 @@ closes the corresponding terminal tab (which sends a `close` message).
 
 import asyncio
 import base64
+import errno
 import hashlib
 import hmac
 import json
@@ -15,6 +16,7 @@ import logging
 import os
 import queue
 import re
+import select
 import signal
 import termios
 import threading
@@ -27,6 +29,7 @@ import tornado.websocket
 from tornado.ioloop import IOLoop
 from tornado.iostream import StreamClosedError
 from ptyprocess import PtyProcess
+from tmux_backend import TmuxBackend, TmuxError
 
 PORT = int(os.environ.get("PORT", "8765"))
 HOST = os.environ.get("HOST", "127.0.0.1")
@@ -51,6 +54,10 @@ MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "32"))
 # that stops reading (hung connection, dead browser) would otherwise let
 # terminal output pile up in memory.
 MAX_WS_PENDING_BYTES = int(os.environ.get("MAX_WS_PENDING", "8388608"))
+MAX_INPUT_MESSAGE_BYTES = 65536
+MAX_INPUT_PENDING_BYTES = 1048576
+MAX_PTY_PENDING_BYTES = 1048576
+cleanup_futures = set()
 # Set to 1 when running behind a trusted reverse proxy so remote_ip honours
 # X-Real-Ip/X-Forwarded-For. Must only be enabled behind a trusted proxy,
 # otherwise clients can spoof their IP.
@@ -80,6 +87,130 @@ _auth_failures = {}
 
 # session_id -> Session
 sessions = {}
+_session_lock = asyncio.Lock()
+tmux_backend = TmuxBackend(os.environ.get(
+    "TMUX_SOCKET",
+    os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "web-terminal-tmux/default"),
+))
+native_tmux_backend = TmuxBackend(
+    os.environ.get("TMUX_NATIVE_SOCKET") or None, source="default", managed=False,
+)
+
+
+async def tmux_listing():
+    managed, native = await asyncio.gather(
+        asyncio.to_thread(tmux_backend.list_sessions),
+        asyncio.to_thread(native_tmux_backend.list_sessions),
+    )
+    seen = {(item["server_pid"], item["tmux_id"]) for item in managed}
+    return managed + [item for item in native if (item["server_pid"], item["tmux_id"]) not in seen]
+
+
+async def session_listing():
+    items = {s["id"]: s for s in await tmux_listing()}
+    for sid, session in sessions.items():
+        item = items.setdefault(sid, {})
+        item.update({
+            "id": sid, "backend": session.backend, "created_at": session.created_at,
+            "clients": len(session.clients),
+        })
+        if session.backend == "pty":
+            item["name"] = session.name
+    return sorted(items.values(), key=lambda item: item["created_at"], reverse=True)
+
+
+async def terminate_session(session_id, backend=None):
+    async with _session_lock:
+        session = sessions.get(session_id)
+        if session and backend and session.backend != backend:
+            return False
+        if not session and backend == "pty":
+            return False
+        kind = session.backend if session else backend
+        if kind == "tmux" or not session:
+            existing = await tmux_listing()
+            item = next((item for item in existing if item["id"] == session_id), None)
+            if not item:
+                return False
+            if item["managed"]:
+                await asyncio.to_thread(tmux_backend.kill, session_id, item["tmux_id"])
+        if session:
+            session.close()
+        return bool(session or kind == "tmux" or not backend)
+
+
+async def rename_session(session_id, backend, name):
+    if not isinstance(name, str) or not name.strip() or len(name.strip()) > 128:
+        raise ValueError("name must contain 1 to 128 characters")
+    name = name.strip()
+    if name.startswith("-") or any(ord(character) < 32 or ord(character) == 127 for character in name):
+        raise ValueError("name cannot start with '-' or contain control characters")
+    async with _session_lock:
+        item = next((item for item in await session_listing() if item["id"] == session_id), None)
+        if not item or (backend and item["backend"] != backend):
+            raise KeyError(session_id)
+        if item["backend"] == "tmux":
+            owner = tmux_backend if item["source"] == "web" else native_tmux_backend
+            await asyncio.to_thread(owner.rename, session_id, item["tmux_id"], name, item["managed"])
+        item["name"] = name
+        session = sessions.get(session_id)
+        if session:
+            session.name = name
+        message = json.dumps({
+            "type": "session_info", "id": session_id, "name": name,
+            "managed": item.get("managed", True),
+        })
+        for current in list(sessions.values()):
+            for client in list(current.clients):
+                client._send(message, binary=False)
+        return item
+
+
+async def acquire_session(session_id, backend, term, colorterm, rows, cols):
+    async with _session_lock:
+        if session_id in sessions:
+            session = sessions[session_id]
+            if session.backend != backend:
+                raise TmuxError("session belongs to a different backend")
+            if backend == "tmux":
+                item = next((item for item in await tmux_listing() if item["id"] == session_id), None)
+                if item:
+                    session.name = item["name"]
+            return session
+        known = await session_listing()
+        existing = next((item for item in known if item["id"] == session_id), None)
+        if existing and existing["backend"] != backend:
+            raise TmuxError("session belongs to a different backend")
+        if MAX_SESSIONS and not existing and len(known) >= MAX_SESSIONS:
+            raise TmuxError("max sessions reached")
+        command = None
+        owner = None
+        if backend == "tmux":
+            if not existing:
+                if session_id.startswith("tmux_external_"):
+                    raise TmuxError("external tmux session no longer exists")
+                shell = SHELL if os.path.isfile(SHELL) and os.access(SHELL, os.X_OK) else "/bin/bash"
+                cwd = CWD if os.path.isdir(CWD) else os.path.expanduser("~")
+                await asyncio.to_thread(
+                    tmux_backend.create, session_id, shell, cwd, rows, cols, colorterm,
+                )
+                existing = next(
+                    item for item in await tmux_listing() if item["id"] == session_id
+                )
+            owner = tmux_backend if existing["source"] == "web" else native_tmux_backend
+            command = owner.attach_command(session_id, existing["tmux_id"])
+        session = Session(
+            session_id, IOLoop.current(), shell=SHELL, cwd=CWD, term=term,
+            colorterm=colorterm, rows=rows, cols=cols, backend=backend, command=command,
+        )
+        if existing:
+            session.created_at = existing["created_at"]
+        session.tmux_backend = owner
+        session.tmux_target = existing["tmux_id"] if existing else None
+        session.name = existing.get("name", "") if existing else ""
+        session.managed = existing.get("managed", True) if existing else True
+        sessions[session_id] = session
+        return session
 
 _TOKEN_QS_RE = re.compile(r"([?&]token=)[^&]*")
 
@@ -196,14 +327,20 @@ def _preexec_setup_pty():
 class Session:
     """Wraps a PTY process and the clients connected to it."""
 
-    def __init__(self, session_id, io_loop, shell=SHELL, cwd=CWD, term=TERM, colorterm=COLORTERM, rows=TERMINAL_ROWS, cols=TERMINAL_COLS):
+    def __init__(self, session_id, io_loop, shell=SHELL, cwd=CWD, term=TERM, colorterm=COLORTERM, rows=TERMINAL_ROWS, cols=TERMINAL_COLS, backend="pty", command=None):
         self.id = session_id
+        self.backend = backend
         self.io_loop = io_loop
         self.clients = set()
         self.buffer = deque()       # recent raw output bytes
         self.buffer_bytes = 0
         self.closed = False
         self.created_at = time.time()
+        self._cleanup_future = None
+        self._input_pending_bytes = 0
+        self._input_lock = threading.Lock()
+        self._output_pending_bytes = 0
+        self._output_condition = threading.Condition()
 
         # Validate shell and cwd; fall back to safe defaults if necessary.
         if not os.path.isfile(shell) or not os.access(shell, os.X_OK):
@@ -221,18 +358,22 @@ class Session:
         # Never hand the access token to child shells; it would be visible
         # via `env` and /proc/<pid>/environ.
         env.pop("TOKEN", None)
+        if backend == "tmux":
+            env.pop("TMUX", None)
+            env.pop("TMUX_PANE", None)
         env["TERM"] = term
         if colorterm:
             env["COLORTERM"] = colorterm
         logging.info("[%s] Spawning shell: %s in %s (TERM=%s, COLORTERM=%s, %dx%d)", self.id, shell, cwd, term, colorterm, cols, rows)
         self.process = PtyProcess.spawn(
-            [shell],
+            command or [shell],
             dimensions=(rows, cols),
-            echo=True,
+            echo=backend != "tmux",
             preexec_fn=_preexec_setup_pty,
             cwd=cwd,
             env=env,
         )
+        os.set_blocking(self.process.fd, False)
 
         # Writes go through a dedicated thread with a FIFO queue: ptyprocess
         # writes with blocking os.write(), and a child that stops reading its
@@ -256,25 +397,35 @@ class Session:
         """
         try:
             while not self.closed:
+                with self._output_condition:
+                    self._output_condition.wait_for(
+                        lambda: self.closed or self._output_pending_bytes < MAX_PTY_PENDING_BYTES,
+                    )
+                    if self.closed:
+                        break
+                    capacity = min(65536, MAX_PTY_PENDING_BYTES - self._output_pending_bytes)
+                if not select.select([self.process.fd], [], [], 0.1)[0]:
+                    continue
                 try:
-                    data = self.process.read(65536)
-                except EOFError:
-                    break
+                    data = os.read(self.process.fd, capacity)
+                except BlockingIOError:
+                    continue
+                except OSError as exc:
+                    if exc.errno == errno.EIO:
+                        break
+                    raise
                 if not data:
                     break
 
+                with self._output_condition:
+                    self._output_pending_bytes += len(data)
                 self.io_loop.add_callback(self._on_pty_data, data)
         except Exception:
             # A closed master fd during session teardown is expected.
             if not self.closed:
                 logging.exception("[%s] Reader error", self.id)
         finally:
-            try:
-                status = self.process.isalive()
-                exit_code = self.process.exitstatus if not status else None
-            except Exception:
-                status, exit_code = None, None
-            logging.info("[%s] PTY reader ended; isalive=%s exitstatus=%s", self.id, status, exit_code)
+            logging.info("[%s] PTY reader ended", self.id)
             try:
                 self.io_loop.add_callback(self.close)
             except Exception:
@@ -292,19 +443,38 @@ class Session:
             if data is None:
                 return
             try:
-                self.process.write(data)
+                pending = memoryview(data)
+                while pending and not self.closed:
+                    if not select.select([], [self.process.fd], [], 0.1)[1]:
+                        continue
+                    try:
+                        written = os.write(self.process.fd, pending)
+                    except BlockingIOError:
+                        continue
+                    if written <= 0:
+                        raise OSError("PTY write made no progress")
+                    pending = pending[written:]
             except Exception:
                 if not self.closed:
                     logging.exception("[%s] Write error", self.id)
+                    self.io_loop.add_callback(self.close)
                 return
+            finally:
+                with self._input_lock:
+                    self._input_pending_bytes -= len(data)
 
     def _on_pty_data(self, data):
         """Buffer a chunk of PTY output and broadcast it. IOLoop thread only."""
-        if self.closed:
-            return
-        self._append_output(data)
-        for client in list(self.clients):
-            client.safe_write(data)
+        try:
+            if self.closed:
+                return
+            self._append_output(data)
+            for client in list(self.clients):
+                client.safe_write(data)
+        finally:
+            with self._output_condition:
+                self._output_pending_bytes -= len(data)
+                self._output_condition.notify_all()
 
     def _append_output(self, data):
         self.buffer.append(data)
@@ -320,35 +490,54 @@ class Session:
         # never overtake this replay.
         replay = b"".join(self.buffer)
         if replay:
+            client._send(json.dumps({"type": "replay_begin"}), binary=False)
             client.safe_write(replay)
+            client._send(json.dumps({"type": "replay_end"}), binary=False)
 
     def remove_client(self, client):
         self.clients.discard(client)
 
     def write(self, data):
-        if self.closed or not self.process or not self.process.isalive():
-            return
-        if isinstance(data, str):
-            data = data.encode("utf-8")
+        if not isinstance(data, str):
+            raise ValueError("input data must be a string")
+        if len(data) > MAX_INPUT_MESSAGE_BYTES:
+            raise ValueError("input message is too large")
+        data = data.encode("utf-8")
+        if len(data) > MAX_INPUT_MESSAGE_BYTES:
+            raise ValueError("input message is too large")
+        if self.closed or not self.process:
+            return False
         # Enqueue only; the writer thread performs the (blocking) os.write
         # so input can never stall the IOLoop.
-        try:
-            self._write_queue.put_nowait(data)
-        except queue.Full:
-            logging.warning("[%s] Input queue full, dropping input", self.id)
+        with self._input_lock:
+            if self._input_pending_bytes + len(data) > MAX_INPUT_PENDING_BYTES:
+                return False
+            try:
+                self._write_queue.put_nowait(data)
+            except queue.Full:
+                return False
+            self._input_pending_bytes += len(data)
+        return True
 
-    def resize(self, rows, cols):
-        if self.closed or not self.process or not self.process.isalive():
+    def resize(self, rows, cols, redraw=False):
+        if self.closed or not self.process:
             return
         try:
+            previous_size = self.process.getwinsize() if redraw else None
             self.process.setwinsize(rows, cols)
+            if redraw and previous_size == (rows, cols):
+                foreground_group = os.tcgetpgrp(self.process.fd)
+                if foreground_group > 0:
+                    os.killpg(foreground_group, signal.SIGWINCH)
         except Exception:
             logging.exception("[%s] Resize error", self.id)
 
     def close(self):
         if self.closed:
-            return
+            return self._cleanup_future
         self.closed = True
+        with self._output_condition:
+            self._output_condition.notify_all()
 
         # Notify all attached clients and close their sockets.
         for client in list(self.clients):
@@ -358,26 +547,35 @@ class Session:
         # Drain pending input and stop the writer thread; nothing that
         # arrives after close should be written anyway.
         try:
-            with self._write_queue.mutex:
-                self._write_queue.queue.clear()
-            self._write_queue.put(None)
+            with self._input_lock:
+                while True:
+                    try:
+                        data = self._write_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if data is not None:
+                        self._input_pending_bytes -= len(data)
+                self._write_queue.put_nowait(None)
         except Exception:
             pass
 
         # Kill the underlying shell/PTY and close the master fd.
-        try:
-            if self.process and self.process.isalive():
-                self.process.terminate(force=True)
-        except Exception:
-            logging.exception("[%s] Terminate error", self.id)
+        self._cleanup_future = self.io_loop.run_in_executor(None, self._reap)
+        cleanup_futures.add(self._cleanup_future)
+        self._cleanup_future.add_done_callback(cleanup_futures.discard)
+        if sessions.get(self.id) is self:
+            sessions.pop(self.id)
+        logging.info("[%s] Session closed", self.id)
+        return self._cleanup_future
+
+    def _reap(self):
+        self._reader_thread.join()
+        self._writer_thread.join()
         try:
             if self.process:
-                self.process.close()
+                self.process.close(force=True)
         except Exception:
             logging.exception("[%s] Process close error", self.id)
-
-        sessions.pop(self.id, None)
-        logging.info("[%s] Session closed", self.id)
 
 
 class TerminalWSHandler(tornado.websocket.WebSocketHandler):
@@ -409,79 +607,98 @@ class TerminalWSHandler(tornado.websocket.WebSocketHandler):
             self.close()
             return
 
-        if sid not in sessions:
-            if MAX_SESSIONS and len(sessions) >= MAX_SESSIONS:
-                try:
-                    await self.write_message(json.dumps({"type": "error", "message": "max sessions reached"}), binary=False)
-                except Exception:
-                    pass
-                self.close()
-                return
-
-            term = self.get_argument("term", default=TERM)
-            if not ENV_VALUE_RE.match(term or ""):
-                term = TERM
-            colorterm = self.get_argument("colorterm", default=COLORTERM)
-            if colorterm and not ENV_VALUE_RE.match(colorterm):
-                colorterm = COLORTERM
-            try:
-                rows = int(self.get_argument("rows", default=TERMINAL_ROWS))
-            except (ValueError, TypeError):
-                rows = TERMINAL_ROWS
-            try:
-                cols = int(self.get_argument("cols", default=TERMINAL_COLS))
-            except (ValueError, TypeError):
-                cols = TERMINAL_COLS
-            if not 1 <= rows <= 500:
-                rows = TERMINAL_ROWS
-            if not 1 <= cols <= 1000:
-                cols = TERMINAL_COLS
-            try:
-                sessions[sid] = Session(sid, IOLoop.current(), shell=SHELL, cwd=CWD, term=term, colorterm=colorterm, rows=rows, cols=cols)
-            except Exception:
-                sessions.pop(sid, None)
-                logging.exception("[%s] Failed to spawn session", sid)
-                try:
-                    await self.write_message(json.dumps({"type": "error", "message": "failed to spawn session"}), binary=False)
-                except Exception:
-                    pass
-                self.close()
-                return
+        backend = self.get_argument("backend", default=sessions[sid].backend if sid in sessions else "pty")
+        if backend not in ("pty", "tmux"):
+            await self.write_message(json.dumps({"type": "error", "message": "invalid backend"}))
+            self.close()
+            return
+        term = self.get_argument("term", default=TERM)
+        if not ENV_VALUE_RE.match(term or ""):
+            term = TERM
+        colorterm = self.get_argument("colorterm", default=COLORTERM)
+        if colorterm and not ENV_VALUE_RE.match(colorterm):
+            colorterm = COLORTERM
+        try:
+            rows = int(self.get_argument("rows", default=TERMINAL_ROWS))
+        except (ValueError, TypeError):
+            rows = TERMINAL_ROWS
+        try:
+            cols = int(self.get_argument("cols", default=TERMINAL_COLS))
+        except (ValueError, TypeError):
+            cols = TERMINAL_COLS
+        if not 1 <= rows <= 500:
+            rows = TERMINAL_ROWS
+        if not 1 <= cols <= 1000:
+            cols = TERMINAL_COLS
+        try:
+            session = await acquire_session(sid, backend, term, colorterm, rows, cols)
+        except Exception as exc:
+            logging.exception("[%s] Failed to spawn session", sid)
+            message = str(exc) if isinstance(exc, TmuxError) else "failed to spawn session"
+            await self.write_message(json.dumps({"type": "error", "message": message}))
+            self.close()
+            return
 
         self.session_id = sid
-        self.session = sessions[sid]
+        self.session = session
         self.session.add_client(self)
         self._send(json.dumps({"type": "session_ready"}), binary=False)
+        self._send(json.dumps({
+            "type": "session_info", "id": sid, "name": self.session.name,
+            "managed": self.session.managed,
+        }), binary=False)
         logging.info("[%s] Client connected (total %d)", sid, len(self.session.clients))
 
-    def on_message(self, message):
+    async def on_message(self, message):
         if not self.session:
             return
         try:
             msg = json.loads(message)
         except Exception:
-            logging.warning("[%s] Malformed WebSocket message: %r", self.session_id, message[:200])
+            self._send(json.dumps({"type": "request_error", "message": "expected a JSON object"}), binary=False)
+            return
+        if not isinstance(msg, dict) or not isinstance(msg.get("type"), str):
+            self._send(json.dumps({"type": "request_error", "message": "expected a typed JSON object"}), binary=False)
             return
 
         mtype = msg.get("type")
         if mtype == "input":
-            self.session.write(msg.get("data", ""))
+            try:
+                accepted = self.session.write(msg.get("data"))
+            except ValueError as exc:
+                self._send(json.dumps({"type": "request_error", "message": str(exc)}), binary=False)
+                return
+            if not accepted:
+                self._send(json.dumps({
+                    "type": "request_error", "message": "terminal input is congested; input was not accepted",
+                }), binary=False)
         elif mtype == "resize":
             rows = msg.get("rows", TERMINAL_ROWS)
             cols = msg.get("cols", TERMINAL_COLS)
-            try:
-                rows = int(rows)
-                cols = int(cols)
-            except (ValueError, TypeError):
+            if type(rows) is not int or type(cols) is not int or not 1 <= rows <= 500 or not 1 <= cols <= 1000:
+                self._send(json.dumps({
+                    "type": "request_error", "message": "resize requires integer rows 1-500 and cols 1-1000",
+                }), binary=False)
                 return
-            if rows <= 0 or cols <= 0 or rows > 500 or cols > 1000:
-                return
-            self.session.resize(rows, cols)
+            self.session.resize(rows, cols, redraw=msg.get("redraw") is True)
+            if self.session.backend == "tmux" and msg.get("redraw") is True:
+                try:
+                    await asyncio.to_thread(
+                        self.session.tmux_backend.refresh, self.session_id,
+                        self.session.process.pid, self.session.tmux_target,
+                    )
+                except TmuxError:
+                    logging.warning("[%s] tmux refresh unavailable", self.session_id)
         elif mtype == "close":
-            self.session.close()
-            self.session = None
+            try:
+                await terminate_session(self.session_id, self.session.backend)
+                self.session = None
+            except TmuxError as exc:
+                self._send(json.dumps({"type": "error", "message": str(exc)}), binary=False)
         elif mtype == "ping":
             self._send(json.dumps({"type": "pong"}), binary=False)
+        else:
+            self._send(json.dumps({"type": "request_error", "message": "unknown message type"}), binary=False)
 
     def on_close(self):
         if self.session:
@@ -604,20 +821,59 @@ class ApiSessionsHandler(tornado.web.RequestHandler):
             return
 
         self.set_header("Content-Type", "application/json")
-        items = [
-            {
-                "id": sid,
-                "created_at": s.created_at,
-                "clients": len(s.clients),
-            }
-            for sid, s in sessions.items()
-        ]
-        items.sort(key=lambda x: x["created_at"], reverse=True)
+        try:
+            items = await session_listing()
+        except TmuxError as exc:
+            self.set_status(503)
+            self.finish(json.dumps({"error": str(exc)}))
+            return
         self.write(json.dumps(items))
+
+
+class ApiBackendsHandler(tornado.web.RequestHandler):
+    async def get(self):
+        if not _check_token(self):
+            if _presented_credential(self):
+                await _throttle_auth_failure(self)
+            self.set_status(403)
+            self.finish({"error": "invalid or missing token"})
+            return
+        self.write({"pty": True, "tmux": await asyncio.to_thread(tmux_backend.status)})
 
 
 class ApiSessionHandler(tornado.web.RequestHandler):
     """Close a specific session by ID."""
+
+    async def patch(self, session_id):
+        if not _check_token(self):
+            if _presented_credential(self):
+                await _throttle_auth_failure(self)
+            self.set_status(403)
+            self.finish({"error": "invalid or missing token"})
+            return
+        backend = self.get_argument("backend", default=None)
+        if not SESSION_ID_RE.fullmatch(session_id) or backend not in (None, "pty", "tmux"):
+            self.set_status(400)
+            self.finish({"error": "invalid session id or backend"})
+            return
+        try:
+            data = json.loads(self.request.body)
+            if not isinstance(data, dict):
+                raise ValueError("expected a JSON object")
+            item = await rename_session(session_id, backend, data.get("name"))
+        except (ValueError, TypeError) as exc:
+            self.set_status(400)
+            self.finish({"error": str(exc)})
+            return
+        except KeyError:
+            self.set_status(404)
+            self.finish({"error": "session not found"})
+            return
+        except TmuxError as exc:
+            self.set_status(409)
+            self.finish({"error": str(exc)})
+            return
+        self.write(item)
 
     async def delete(self, session_id):
         if not _check_token(self):
@@ -628,12 +884,25 @@ class ApiSessionHandler(tornado.web.RequestHandler):
             self.finish(json.dumps({"error": "invalid or missing token"}))
             return
 
-        session = sessions.get(session_id)
-        if not session:
+        if not SESSION_ID_RE.fullmatch(session_id):
+            self.set_status(400)
+            self.finish({"error": "invalid session id"})
+            return
+        backend = self.get_argument("backend", default=None)
+        if backend not in (None, "pty", "tmux"):
+            self.set_status(400)
+            self.finish({"error": "invalid backend"})
+            return
+        try:
+            removed = await terminate_session(session_id, backend)
+        except TmuxError as exc:
+            self.set_status(503)
+            self.finish({"error": str(exc)})
+            return
+        if not removed:
             self.set_status(404)
             self.finish(json.dumps({"error": "session not found"}))
             return
-        session.close()
         self.set_status(204)
         self.finish()
 
@@ -736,11 +1005,13 @@ def make_app():
             (r"/logout", LogoutHandler),
             (r"/ws", TerminalWSHandler),
             (r"/api/sessions", ApiSessionsHandler),
+            (r"/api/backends", ApiBackendsHandler),
             (r"/api/sessions/([^/]+)", ApiSessionHandler),
             (r"/static/(.*)", AuthStaticFileHandler, {"path": static_path}),
         ],
         debug=False,
         log_function=_log_request,
+        websocket_max_message_size=MAX_INPUT_MESSAGE_BYTES * 12,
     )
 
 
@@ -758,10 +1029,13 @@ if __name__ == "__main__":
             "Listening on %s with TOKEN unset — anyone who can reach this "
             "port gets a shell as this user. Set TOKEN or bind to loopback.", HOST)
 
-    def shutdown():
+    async def shutdown():
         logging.info("Shutting down...")
+        server.stop()
         for s in list(sessions.values()):
             s.close()
+        if cleanup_futures:
+            await asyncio.gather(*list(cleanup_futures))
         IOLoop.current().stop()
 
     def _handle_signal(signum, frame):

@@ -2,6 +2,9 @@ const tabsEl = document.getElementById('tabs');
 const terminalArea = document.getElementById('terminal-area');
 const tabs = [];
 let activeTabId = null;
+let currentGroup = ['pty', 'tmux', 'all'].includes(localStorage.getItem('webterm-group'))
+  ? localStorage.getItem('webterm-group') : 'all';
+let tmuxAvailable = false;
 let ctrlArmed = false;
 let altArmed = false;
 let shiftArmed = false;
@@ -14,6 +17,17 @@ const i18n = {
     newTerminal: '新建终端',
     closeTerminal: '关闭终端',
     closeAll: '终止所有会话',
+    closeGroup: '关闭当前分组',
+    sessions: '会话',
+    refresh: '刷新',
+    confirmCloseTmux: '结束此 tmux 会话及其中运行的程序？此操作不是断开连接。',
+    confirmCloseGroup: '关闭当前分组？PTY 和本项目 tmux 会话会结束；外部 tmux 会话只断开网页连接。',
+    detach: '断开网页连接，保留原有 tmux 会话',
+    tmuxUnavailable: 'tmux 后端不可用，请启动 web-terminal-tmux.service。',
+    connectionError: '连接失败',
+    closeError: '关闭会话失败，请重试。',
+    renameError: '重命名失败，请检查名称后重试。',
+    inputBusy: '粘贴内容过大或连接拥塞，本次输入未发送；请分批输入。',
     settings: '设置',
     terminalSettings: '终端设置',
     general: '常规',
@@ -75,6 +89,17 @@ const i18n = {
     newTerminal: 'New Terminal',
     closeTerminal: 'Close Terminal',
     closeAll: 'Terminate all sessions',
+    closeGroup: 'Close Group',
+    sessions: 'Sessions',
+    refresh: 'Refresh',
+    confirmCloseTmux: 'End this tmux session and its running programs? This is not a detach.',
+    confirmCloseGroup: 'Close this group? PTY and managed tmux sessions will end; external tmux sessions will only be detached.',
+    detach: 'Disconnect from the web without ending the external tmux session',
+    tmuxUnavailable: 'tmux backend unavailable. Start web-terminal-tmux.service.',
+    connectionError: 'Connection failed',
+    closeError: 'Failed to close session. Please retry.',
+    renameError: 'Failed to rename session. Check the name and retry.',
+    inputBusy: 'Paste is too large or the connection is congested. Input was not sent; use smaller batches.',
     settings: 'Settings',
     terminalSettings: 'Terminal Settings',
     general: 'General',
@@ -147,12 +172,17 @@ function updateI18n() {
   });
   const settingsBtn = document.getElementById('settings-btn');
   if (settingsBtn) settingsBtn.textContent = t('settings');
-  if (plusEl) { plusEl.title = t('newTerminal'); plusEl.setAttribute('aria-label', t('newTerminal')); }
   renderStatus();
+  const closeAll = document.getElementById('close-all-btn');
+  if (closeAll) closeAll.textContent = t('closeGroup');
   tabs.forEach(tab => {
     const close = tab.tabEl.querySelector('.close');
-    if (close) { close.title = t('close'); close.setAttribute('aria-label', t('close')); }
+    if (close) {
+      close.title = t(tab.managed === false ? 'detach' : 'close');
+      close.setAttribute('aria-label', close.title);
+    }
   });
+  updateGroups();
 }
 
 const themePresets = {
@@ -222,21 +252,34 @@ function saveSettings() {
   localStorage.setItem(getSettingsKey(), JSON.stringify(currentSettings));
 }
 
-const titlesKey = 'webterm-titles';
-function loadSavedTitles() {
-  try {
-    return JSON.parse(localStorage.getItem(titlesKey)) || {};
-  } catch (e) {}
-  return {};
-}
-let savedTitles = loadSavedTitles();
-function saveSavedTitles() {
-  localStorage.setItem(titlesKey, JSON.stringify(savedTitles));
+function getTabTitle(sessionId, fallback = '') {
+  return fallback || sessionId.replace(/^tmux_/, '').slice(0, 8);
 }
 
-function getTabTitle(sessionId) {
-  const saved = savedTitles[sessionId];
-  return (saved && saved.trim()) ? saved.trim() : sessionId.slice(0, 8);
+function updateActiveTitle() {
+  const tab = tabs.find(tab => tab.id === activeTabId);
+  const title = tab ? tab.title : 'Web Terminal';
+  const heading = document.getElementById('terminal-title');
+  if (heading) {
+    heading.textContent = title;
+    heading.title = title;
+  }
+  document.title = tab ? `${title} — Web Terminal` : 'Web Terminal';
+}
+
+function updateTabTitle(tab) {
+  tab.title = getTabTitle(tab.id, tab.name || tab.terminalTitle);
+  if (!tab.titleEl.isContentEditable) tab.titleEl.textContent = tab.title;
+  tab.tabEl.title = tab.title;
+  const close = tab.tabEl.querySelector('.close');
+  if (close) close.title = t(tab.managed === false ? 'detach' : 'close');
+  if (tab.id === activeTabId) updateActiveTitle();
+}
+
+function applySessionMetadata(tab, metadata) {
+  if (typeof metadata.name === 'string') tab.name = metadata.name;
+  if (typeof metadata.managed === 'boolean') tab.managed = metadata.managed;
+  updateTabTitle(tab);
 }
 
 function getThemeObject() {
@@ -329,6 +372,25 @@ function probeConnection(tab, timeout = 10000) {
   }, timeout);
 }
 
+function scheduleTerminalRefresh(tab) {
+  if (!tab || !tab.term || tab.id !== activeTabId || document.hidden || tab.refreshTimer) return;
+  tab.refreshTimer = setTimeout(() => {
+    tab.refreshTimer = null;
+    if (tab.term && tab.id === activeTabId && !document.hidden) {
+      tab.term.refresh(0, tab.term.rows - 1);
+    }
+  }, 100);
+}
+
+function sendTabSize(tab, redraw = false) {
+  if (!tab || !tab.term || !tab.ws || tab.ws.readyState !== WebSocket.OPEN) return;
+  if (tab.resizeTimer) clearTimeout(tab.resizeTimer);
+  tab.resizeTimer = null;
+  tab.ws.send(JSON.stringify({
+    type: 'resize', cols: tab.term.cols, rows: tab.term.rows, redraw
+  }));
+}
+
 function setupKeepalive(tab) {
   if (tab.keepaliveTimer) clearInterval(tab.keepaliveTimer);
   tab.keepaliveTimer = null;
@@ -405,16 +467,62 @@ async function pasteFromClipboard() {
   }
 }
 
-const plusEl = document.createElement('button');
-plusEl.type = 'button';
-plusEl.className = 'tab-add';
-plusEl.title = t('newTerminal');
-plusEl.textContent = '+';
-plusEl.onclick = (e) => {
-  e.stopPropagation();
-  newTerminal();
-};
-tabsEl.appendChild(plusEl);
+function showNotice(message = '') {
+  const notice = document.getElementById('notice');
+  if (!notice) return;
+  notice.textContent = message ? t(message) : '';
+  notice.hidden = !message;
+  updateLayout();
+}
+
+function visibleTabs() {
+  return tabs.filter(tab => currentGroup === 'all' || tab.backend === currentGroup);
+}
+
+function updateGroups() {
+  for (const group of ['pty', 'tmux', 'all']) {
+    const button = document.getElementById('group-' + group);
+    if (!button) continue;
+    const count = tabs.filter(tab => group === 'all' || tab.backend === group).length;
+    button.textContent = `${group === 'pty' ? 'PTY' : group === 'tmux' ? 'tmux' : 'All'} (${count})`;
+    button.setAttribute('aria-selected', String(currentGroup === group));
+  }
+  tabs.forEach(tab => { tab.tabEl.hidden = currentGroup !== 'all' && tab.backend !== currentGroup; });
+  const closeAll = document.getElementById('close-all-btn');
+  if (closeAll) closeAll.disabled = visibleTabs().length === 0;
+}
+
+function setGroup(group) {
+  if (!['pty', 'tmux', 'all'].includes(group)) return;
+  currentGroup = group;
+  localStorage.setItem('webterm-group', group);
+  updateGroups();
+  if (!visibleTabs().some(tab => tab.id === activeTabId)) {
+    const next = visibleTabs()[0];
+    if (next) switchTab(next.id);
+    else {
+      activeTabId = null;
+      tabs.forEach(tab => tab.container.classList.remove('active'));
+      clearSessionFromUrl();
+    }
+  }
+  updateEmptyState();
+}
+
+function toggleSidebar() {
+  const mobile = window.matchMedia('(max-width: 640px)').matches;
+  document.body.classList.toggle(mobile ? 'sidebar-open' : 'sidebar-collapsed');
+  updateSidebarState();
+  updateLayout();
+}
+
+function updateSidebarState() {
+  const mobile = window.matchMedia('(max-width: 640px)').matches;
+  const expanded = mobile ? document.body.classList.contains('sidebar-open')
+    : !document.body.classList.contains('sidebar-collapsed');
+  const toggle = document.getElementById('sidebar-toggle');
+  if (toggle) toggle.setAttribute('aria-expanded', String(expanded));
+}
 
 function genSessionId() {
   const b = new Uint8Array(12);
@@ -447,13 +555,13 @@ function debounce(fn, wait) {
   };
 }
 
-function getWsUrl(sessionId) {
+function getWsUrl(sessionId, backend = 'pty') {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const term = encodeURIComponent(currentSettings.term || 'xterm-256color');
   const colorterm = currentSettings.colorterm ? encodeURIComponent(currentSettings.colorterm) : '';
   const rows = parseInt(currentSettings.termRows, 10) || 24;
   const cols = parseInt(currentSettings.termCols, 10) || 80;
-  const url = `${proto}//${location.host}/ws?session=${encodeURIComponent(sessionId)}&term=${term}&colorterm=${colorterm}&rows=${rows}&cols=${cols}`;
+  const url = `${proto}//${location.host}/ws?session=${encodeURIComponent(sessionId)}&backend=${backend}&term=${term}&colorterm=${colorterm}&rows=${rows}&cols=${cols}`;
   return appendToken(url);
 }
 
@@ -461,44 +569,46 @@ function updateUrl(sessionId) {
   if (!sessionId) return;
   const params = new URLSearchParams(location.search);
   params.set('session', sessionId);
+  const tab = tabs.find(tab => tab.id === sessionId);
+  if (tab) params.set('backend', tab.backend);
   history.replaceState({}, '', '?' + params.toString());
 }
 
 function clearSessionFromUrl() {
   const params = new URLSearchParams(location.search);
   params.delete('session');
+  params.delete('backend');
   const qs = params.toString();
   history.replaceState({}, '', qs ? '?' + qs : location.pathname);
 }
 
-function newTerminal() {
-  const sid = genSessionId();
-  createTab(sid, true);
+function newTerminal(backend = currentGroup === 'tmux' ? 'tmux' : 'pty') {
+  if (!['pty', 'tmux'].includes(backend)) return;
+  if (backend === 'tmux' && !tmuxAvailable) {
+    showNotice(t('tmuxUnavailable'));
+    return;
+  }
+  showNotice();
+  const sid = (backend === 'tmux' ? 'tmux_' : '') + genSessionId();
+  createTab(sid, true, backend);
 }
 
 function updateEmptyState() {
   const empty = document.getElementById('empty-state');
   if (!empty) return;
-  empty.classList.toggle('visible', tabs.length === 0);
+  empty.classList.toggle('visible', visibleTabs().length === 0);
+  updateGroups();
+  updateActiveTitle();
   renderStatus();
 }
 
 let loadError = false;
-let noticeTimer = null;
-
-function showNotice(key) {
-  const notice = document.getElementById('notice');
-  clearTimeout(noticeTimer);
-  notice.textContent = t(key);
-  notice.hidden = false;
-  noticeTimer = setTimeout(() => { notice.hidden = true; }, 6000);
-}
 
 function setConnectionState(tab, state, errorKey = '') {
   tab.state = state;
   tab.errorKey = errorKey;
   tab.tabEl.dataset.state = state;
-  tab.tabEl.title = t(errorKey || state);
+  tab.tabEl.title = `${tab.title} · ${t(errorKey || state)}`;
   renderStatus();
 }
 
@@ -516,9 +626,9 @@ function renderStatus() {
   document.getElementById('connection-text').textContent = parts.join(' · ');
   const retry = document.getElementById('reconnect-btn');
   retry.hidden = !(['disconnected', 'reconnecting', 'ended', 'error'].includes(state));
-  retry.textContent = t(!tab && loadError ? 'reload' : (state === 'ended' || (tab && tab.errorKey === 'invalidSession') ? 'createAgain' : 'retry'));
+  retry.textContent = t(!tab && loadError ? 'reload' : ((state === 'ended' && tab?.backend !== 'tmux') || (tab && tab.errorKey === 'invalidSession') ? 'createAgain' : 'retry'));
   retry.disabled = !!(tab && tab.closing);
-  document.getElementById('close-all-btn').disabled = tabs.length === 0 || closingAll;
+  document.getElementById('close-all-btn').disabled = visibleTabs().length === 0 || closingAll;
   // A wrapped error message or retry button can change the terminal's available height.
   if (tab && currentSettings.autoFit) applyTabSize(tab);
 }
@@ -526,14 +636,12 @@ function renderStatus() {
 function retryActiveConnection() {
   const tab = tabs.find(t => t.id === activeTabId);
   if (!tab) { if (loadError) location.reload(); return; }
-  if (tab.state === 'ended' || tab.errorKey === 'invalidSession') newTerminal();
+  if ((tab.state === 'ended' && tab.backend !== 'tmux') || tab.errorKey === 'invalidSession') newTerminal(tab.backend);
   else reconnectTab(tab);
 }
 
 function syncTerminalSize(tab) {
-  if (tab.term && tab.ws && tab.ws.readyState === WebSocket.OPEN) {
-    tab.ws.send(JSON.stringify({ type: 'resize', cols: tab.term.cols, rows: tab.term.rows }));
-  }
+  sendTabSize(tab, true);
   renderStatus();
 }
 
@@ -562,10 +670,11 @@ function reconnectTab(tab) {
     try { tab.ws.onmessage = null; } catch (e) {}
     try { tab.ws.close(); } catch (e) {}
   }
-  const ws = new WebSocket(getWsUrl(tab.id));
+  const ws = new WebSocket(getWsUrl(tab.id, tab.backend));
   ws.binaryType = 'arraybuffer';
   tab.ws = ws;
   tab.initialSync = true;
+  tab.receivingReplay = false;
   tab.intentionalClose = false;
 
   ws.onopen = () => {
@@ -577,7 +686,7 @@ function reconnectTab(tab) {
       ensureTerm(tab);
       applyTabSize(tab);
       syncTerminalSize(tab);
-      if (!document.getElementById('settings-modal').classList.contains('active')) tab.term.focus();
+      if (!document.getElementById('settings-modal')?.classList.contains('active')) tab.term.focus();
     }
   };
 
@@ -595,6 +704,18 @@ function reconnectTab(tab) {
           setConnectionState(tab, 'connected');
           if (tab.id === activeTabId) syncTerminalSize(tab);
         }
+        if (msg.type === 'replay_begin') tab.receivingReplay = true;
+        if (msg.type === 'replay_end') tab.receivingReplay = false;
+        if (msg.type === 'session_info') {
+          const target = msg.id ? tabs.find(tab => tab.id === msg.id) : tab;
+          if (target) applySessionMetadata(target, msg);
+          if (!msg.id || msg.id === tab.id) {
+            tab.hasConnected = true;
+            tab.reconnectAttempts = 0;
+            setConnectionState(tab, 'connected');
+          }
+        }
+        if (msg.type === 'request_error') showNotice(msg.message || t('connectionError'));
         if (msg.type === 'session_closed' || msg.type === 'error') {
           const errors = { 'max sessions reached': 'maxSessions', 'failed to spawn session': 'spawnFailed', 'invalid session id': 'invalidSession' };
           setConnectionState(tab, msg.type === 'session_closed' ? 'ended' : 'error',
@@ -604,6 +725,7 @@ function reconnectTab(tab) {
           // later: it would spawn a fresh shell under the ended id.
           if (tab.probeTimer) { clearTimeout(tab.probeTimer); tab.probeTimer = null; }
           tab.awaitingPong = false;
+          if (msg.type === 'error') showNotice(`${t('connectionError')}: ${msg.message || ''}`);
           tab.intentionalClose = true;
           if (tab.ws && (tab.ws.readyState === WebSocket.OPEN || tab.ws.readyState === WebSocket.CONNECTING)) {
             tab.ws.close();
@@ -617,6 +739,11 @@ function reconnectTab(tab) {
       return;
     }
     if (!tab.term) return;
+    const replay = tab.receivingReplay;
+    tab.term.write('', () => {
+      tab.parsingReplay = replay;
+      tab.responseSocket = ws;
+    });
     if (tab.initialSync) {
       // In-band RIS (Reset to Initial State) instead of term.reset().
       // This clears the buffer and resets the parser synchronously with
@@ -680,7 +807,16 @@ function setupTouchScroll(host, terminal, sessionId, tabObj) {
     if (rowHeight <= 0) return;
     const lines = Math.trunc(total / rowHeight);
     remainder = total - lines * rowHeight;
-    if (lines !== 0) terminal.scrollLines(-lines);
+    if (lines !== 0) {
+      if (tabObj && tabObj.backend === 'tmux' && terminal.buffer.active.type === 'alternate'
+          && terminal.modes.mouseTrackingMode !== 'none') {
+        if (tabObj.ws && tabObj.ws.readyState === WebSocket.OPEN) {
+          tabObj.ws.send(JSON.stringify({
+            type: 'input', data: `\x1b[<${lines > 0 ? 64 : 65};1;1M`.repeat(Math.min(Math.abs(lines), 100))
+          }));
+        }
+      } else terminal.scrollLines(-lines);
+    }
   }
 
   function cancelInertia() {
@@ -842,9 +978,21 @@ function ensureTerm(tab) {
   const helperTextareaBusy = () => pendingCompositionSend ||
     !!(term.element && term.element.querySelector('.composition-view.active'));
 
+  term.onWriteParsed(() => scheduleTerminalRefresh(tab));
+  term.onTitleChange(title => {
+    tab.terminalTitle = title;
+    updateTabTitle(tab);
+  });
+
   term.onData((data) => {
     const tab = tabs.find(t => t.id === sessionId);
     if (!tab || !tab.ws || tab.ws.readyState !== WebSocket.OPEN) return;
+    if (/^\x1b\[[0-?]*[ -/]*[cnRty]$/.test(data) || /^\x1bP[^\x1b]*\x1b\\$/.test(data)) {
+      if (!tab.parsingReplay && (!tab.responseSocket || tab.responseSocket === tab.ws)) {
+        sendTerminalInput(tab, data, true, true);
+      }
+      return;
+    }
     // Stop any fling scroll so user input (e.g. virtual keyboard) does
     // not fight the viewport.
     if (tab.cancelInertia) tab.cancelInertia();
@@ -858,15 +1006,14 @@ function ensureTerm(tab) {
     if (helperTextarea && helperTextarea.value && !helperTextareaBusy()) helperTextarea.value = '';
   });
 
-  term.onResize(({ cols, rows }) => {
+  term.onResize(() => {
     const tab = tabs.find(t => t.id === sessionId);
     if (!tab) return;
     if (tab.resizeTimer) clearTimeout(tab.resizeTimer);
     tab.resizeTimer = setTimeout(() => {
-      if (tab.ws && tab.ws.readyState === WebSocket.OPEN) {
-        tab.ws.send(JSON.stringify({ type: 'resize', cols, rows }));
-        renderStatus();
-      }
+      tab.resizeTimer = null;
+      sendTabSize(tab);
+      renderStatus();
     }, 100);
   });
 
@@ -893,9 +1040,10 @@ function ensureTerm(tab) {
   tab.cancelInertia = setupTouchScroll(container, term, sessionId, tab);
 }
 
-function createTab(sessionId, active = false) {
+function createTab(sessionId, active = false, backend = 'pty', metadata = {}) {
   const existing = tabs.find(t => t.id === sessionId);
   if (existing) {
+    applySessionMetadata(existing, metadata);
     if (active) switchTab(sessionId);
     return existing;
   }
@@ -919,6 +1067,10 @@ function createTab(sessionId, active = false) {
   closeEl.title = t('close');
   closeEl.textContent = '×';
   tabEl.appendChild(titleEl);
+  const badge = document.createElement('span');
+  badge.className = 'backend-badge';
+  badge.textContent = backend === 'tmux' ? 'tmux' : 'PTY';
+  tabEl.appendChild(badge);
   tabEl.appendChild(closeEl);
   tabEl.onclick = (e) => {
     if (e.target.classList.contains('close')) {
@@ -929,14 +1081,15 @@ function createTab(sessionId, active = false) {
       switchTab(sessionId);
     }
   };
-  tabsEl.insertBefore(tabEl, plusEl);
+  tabsEl.appendChild(tabEl);
 
   const container = document.createElement('div');
   container.className = 'term-container' + (active ? ' active' : '');
   terminalArea.appendChild(container);
 
-  const tab = { state: 'disconnected', reconnectAttempts: 0, id: sessionId, sessionId, tabEl, container, term: null, fitAddon: null, searchAddon: null, searchTerm: '', ws: null, initialSync: true, intentionalClose: false, parked: false, awaitingPong: false, probeTimer: null, resizeTimer: null, copyTimer: null, title: getTabTitle(sessionId), cancelInertia: null };
+  const tab = { state: 'disconnected', reconnectAttempts: 0, id: sessionId, sessionId, backend, tabEl, titleEl, container, term: null, fitAddon: null, searchAddon: null, searchTerm: '', ws: null, initialSync: true, intentionalClose: false, parked: false, awaitingPong: false, probeTimer: null, resizeTimer: null, copyTimer: null, title: getTabTitle(sessionId), cancelInertia: null, name: '', terminalTitle: '', managed: true };
   tabs.push(tab);
+  applySessionMetadata(tab, metadata);
 
   titleEl.addEventListener('dblclick', (e) => {
     e.stopPropagation();
@@ -954,6 +1107,12 @@ function createTab(sessionId, active = false) {
 }
 
 function switchTab(sessionId) {
+  const target = tabs.find(tab => tab.id === sessionId);
+  if (!target) return;
+  if (currentGroup !== 'all' && currentGroup !== target.backend) {
+    currentGroup = target.backend;
+    localStorage.setItem('webterm-group', currentGroup);
+  }
   ctrlArmed = false;
   altArmed = false;
   shiftArmed = false;
@@ -972,19 +1131,34 @@ function switchTab(sessionId) {
       if (!tab.intentionalClose) reconnectTab(tab);
     } else if (tab.ws.readyState === WebSocket.OPEN) {
       applyTabSize(tab);
+      sendTabSize(tab, true);
       // Switching to a tab is also a good moment to detect a socket that
       // silently died while it was offscreen.
       probeConnection(tab, RESUME_PROBE_MS);
     }
+    scheduleTerminalRefresh(tab);
     tab.term.focus();
   }
   updateUrl(sessionId);
-  if (tab) tab.tabEl.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  if (tab) tab.tabEl.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
   renderStatus();
+  updateEmptyState();
+  if (window.matchMedia('(max-width: 640px)').matches) {
+    document.body.classList.remove('sidebar-open');
+    updateSidebarState();
+  }
+}
+
+async function renameTab(tab, name) {
+  const response = await fetch(appendToken(`/api/sessions/${encodeURIComponent(tab.id)}?backend=${tab.backend}`), {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name })
+  });
+  if (!response.ok) throw new Error(t('renameError'));
+  applySessionMetadata(tab, await response.json());
 }
 
 function startInlineRename(titleEl, tab) {
-  if (titleEl.isContentEditable) return;
+  if (titleEl.isContentEditable || tab.renaming) return;
   titleEl.contentEditable = 'true';
   titleEl.classList.add('editing');
   titleEl.focus();
@@ -996,18 +1170,23 @@ function startInlineRename(titleEl, tab) {
     sel.addRange(range);
   } catch (e) {}
 
-  const finish = (save) => {
+  const finish = async (save) => {
+    const newTitle = titleEl.textContent.trim();
     titleEl.contentEditable = 'false';
     titleEl.classList.remove('editing');
     titleEl.removeEventListener('blur', onBlur);
     titleEl.removeEventListener('keydown', onKeydown);
-    if (save) {
-      const newTitle = titleEl.textContent.trim();
-      tab.title = newTitle || tab.sessionId.slice(0, 8);
-      savedTitles[tab.id] = tab.title;
-      saveSavedTitles();
+    if (save && newTitle !== tab.title) {
+      tab.renaming = true;
+      try {
+        await renameTab(tab, newTitle);
+      } catch (err) {
+        showNotice(t('renameError'));
+      } finally {
+        tab.renaming = false;
+      }
     }
-    titleEl.textContent = tab.title;
+    updateTabTitle(tab);
   };
   const onBlur = () => finish(true);
   const onKeydown = (e) => {
@@ -1025,8 +1204,8 @@ function startInlineRename(titleEl, tab) {
 
 let closingAll = false;
 
-async function closeSession(sessionId) {
-  const url = appendToken(`/api/sessions/${encodeURIComponent(sessionId)}`);
+async function closeSession(sessionId, backend) {
+  const url = appendToken(`/api/sessions/${encodeURIComponent(sessionId)}?backend=${backend}`);
   const resp = await fetch(url, { method: 'DELETE' });
   if (!resp.ok && resp.status !== 404) throw new Error(`HTTP ${resp.status}`);
 }
@@ -1034,14 +1213,15 @@ async function closeSession(sessionId) {
 async function closeTab(sessionId, confirmed = false) {
   const tab = tabs.find(t => t.id === sessionId);
   if (!tab || tab.closing) return;
-  if (!confirmed && tab.state !== 'ended' && !confirm(t('closeConfirm').replace('{name}', tab.title))) return;
+  if (!confirmed && tab.managed && tab.state !== 'ended'
+      && !confirm(t('closeConfirm').replace('{name}', tab.title))) return;
   tab.closing = true;
   if (tab.reconnectTimer) clearTimeout(tab.reconnectTimer);
   // Cancel an in-flight handshake before deleting; it must not create a new PTY afterwards.
   if (tab.ws && tab.ws.readyState === WebSocket.CONNECTING) tab.ws.close();
   renderStatus();
   try {
-    await closeSession(sessionId);
+    await closeSession(sessionId, tab.backend);
   } catch (err) {
     tab.closing = false;
     showNotice('closeFailed');
@@ -1053,29 +1233,46 @@ async function closeTab(sessionId, confirmed = false) {
   if (tab.probeTimer) clearTimeout(tab.probeTimer);
   if (tab.resizeTimer) clearTimeout(tab.resizeTimer);
   if (tab.copyTimer) clearTimeout(tab.copyTimer);
-  if (tab.ws) tab.ws.close();
+  if (tab.refreshTimer) clearTimeout(tab.refreshTimer);
+  tab.refreshTimer = null;
+
+  if (tab.ws) {
+    if (tab.ws.readyState <= WebSocket.OPEN) {
+      tab.ws.close();
+    }
+  }
+
+  tab.closing = false;
+
   if (tab.cancelInertia) tab.cancelInertia();
-  if (tab.term) tab.term.dispose();
+  if (tab.term) {
+    tab.term.dispose();
+    tab.term = null;
+  }
   tab.tabEl.remove();
   tab.container.remove();
   tabs.splice(tabs.indexOf(tab), 1);
-  delete savedTitles[sessionId];
-  saveSavedTitles();
+
   if (activeTabId === sessionId) {
-    if (tabs.length) switchTab(tabs[0].id);
-    else { activeTabId = null; clearSessionFromUrl(); }
+    if (visibleTabs().length) {
+      switchTab(visibleTabs()[0].id);
+    } else {
+      activeTabId = null;
+      clearSessionFromUrl();
+    }
   }
   updateEmptyState();
   renderStatus();
 }
 
 async function closeAllTabs() {
-  if (!tabs.length || closingAll) return;
-  if (!confirm(t('closeAllConfirm').replace('{count}', tabs.length))) return;
+  const targets = visibleTabs();
+  if (!targets.length || closingAll) return;
+  if (!confirm(t('confirmCloseGroup'))) return;
   closingAll = true;
   renderStatus();
   try {
-    for (const tab of [...tabs].reverse()) await closeTab(tab.id, true);
+    for (const tab of [...targets].reverse()) await closeTab(tab.id, true);
   } finally {
     closingAll = false;
     renderStatus();
@@ -1087,12 +1284,20 @@ function updateLayout() {
   // the visible area when the mobile virtual keyboard appears.
   const h = window.visualViewport ? window.visualViewport.height : window.innerHeight;
   document.body.style.height = h + 'px';
-  if (activeTabId && currentSettings.autoFit) {
-    const tab = tabs.find(t => t.id === activeTabId);
-    applyTabSize(tab);
-  }
+  const tab = tabs.find(t => t.id === activeTabId);
+  if (currentSettings.autoFit) applyTabSize(tab);
+  scheduleTerminalRefresh(tab);
+  updateSidebarState();
 }
 window.addEventListener('resize', debounce(updateLayout, 150));
+function restoreTerminal() {
+  updateLayout();
+  sendTabSize(tabs.find(t => t.id === activeTabId), true);
+}
+window.addEventListener('focus', restoreTerminal);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) restoreTerminal();
+});
 if (window.visualViewport) {
   window.visualViewport.addEventListener('resize', debounce(updateLayout, 100));
   window.visualViewport.addEventListener('resize', () => {
@@ -1102,8 +1307,12 @@ if (window.visualViewport) {
   });
 }
 
-function sendTerminalInput(tab, data, literal = false) {
+function sendTerminalInput(tab, data, literal = false, preserveModifiers = false) {
   if (!tab || !tab.ws || tab.ws.readyState !== WebSocket.OPEN) return;
+  if (typeof data !== 'string' || data.length > 262144 || tab.ws.bufferedAmount > 1048576) {
+    showNotice(t('inputBusy'));
+    return;
+  }
   let out = data;
   if (!literal && (ctrlArmed || altArmed || shiftArmed)) {
     const modifier = 1 + Number(shiftArmed) + 2 * Number(altArmed) + 4 * Number(ctrlArmed);
@@ -1126,9 +1335,19 @@ function sendTerminalInput(tab, data, literal = false) {
       if (altArmed) out = '\x1b' + out;
     }
   }
-  ctrlArmed = altArmed = shiftArmed = false;
-  updateModifierButtons();
-  tab.ws.send(JSON.stringify({ type: 'input', data: out }));
+  if (!preserveModifiers) {
+    ctrlArmed = altArmed = shiftArmed = false;
+    updateModifierButtons();
+  }
+  let chunk = '';
+  for (const character of out) {
+    if (chunk.length + character.length > 16384) {
+      tab.ws.send(JSON.stringify({ type: 'input', data: chunk }));
+      chunk = '';
+    }
+    chunk += character;
+  }
+  if (chunk) tab.ws.send(JSON.stringify({ type: 'input', data: chunk }));
 }
 
 function sendToActiveTerminal(text, literal = false) {
@@ -1221,6 +1440,8 @@ function disconnectAllTabs() {
     if (t.probeTimer) clearTimeout(t.probeTimer);
     if (t.resizeTimer) clearTimeout(t.resizeTimer);
     if (t.copyTimer) clearTimeout(t.copyTimer);
+    if (t.refreshTimer) clearTimeout(t.refreshTimer);
+    t.refreshTimer = null;
     if (t.ws) t.ws.close();
   });
 }
@@ -1399,6 +1620,42 @@ function resetSettings() {
   openSettings();
 }
 
+async function refreshSessions() {
+  try {
+    const [response, capabilities] = await Promise.all([
+      fetch(appendToken('/api/sessions')), fetch(appendToken('/api/backends'))
+    ]);
+    if ([response.status, capabilities.status].some(status => status === 401 || status === 403)) {
+      location.href = '/login';
+      return;
+    }
+    if (!response.ok || (!capabilities.ok && capabilities.status !== 404)) throw new Error(t('connectionError'));
+    tmuxAvailable = capabilities.ok && (await capabilities.json()).tmux === true;
+    const tmuxButton = document.getElementById('new-tmux-btn');
+    if (tmuxButton) {
+      tmuxButton.disabled = !tmuxAvailable;
+      tmuxButton.title = tmuxAvailable ? '+ tmux' : t('tmuxUnavailable');
+    }
+    const sessList = await response.json();
+    const querySid = getQuerySession();
+    const queryBackend = new URLSearchParams(location.search).get('backend') === 'tmux' ? 'tmux' : 'pty';
+    if (querySid && !sessList.some(session => session.id === querySid)) {
+      sessList.push({ id: querySid, backend: queryBackend });
+    }
+    sessList.forEach(session => createTab(session.id, false, session.backend || 'pty', session));
+    const initial = tabs.find(tab => tab.id === querySid)
+      || visibleTabs().find(tab => tab.id === activeTabId) || visibleTabs()[0];
+    if (initial) switchTab(initial.id);
+    loadError = false;
+    updateI18n();
+    updateEmptyState();
+  } catch (err) {
+    loadError = true;
+    showNotice('loadFailed');
+    renderStatus();
+  }
+}
+
 async function init() {
   // Drop ?token= from the address bar: the server has already issued an
   // auth cookie for this session, so the token does not need to stay in
@@ -1410,26 +1667,7 @@ async function init() {
     history.replaceState({}, '', qs ? '?' + qs : location.pathname);
   }
   try {
-    const resp = await fetch(appendToken('/api/sessions'));
-    if (resp.status === 401 || resp.status === 403) {
-      location.href = '/login';
-      return;
-    }
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const sessList = await resp.json();
-    const querySid = getQuerySession();
-
-    if (querySid && !sessList.find(s => s.id === querySid)) {
-      sessList.push({ id: querySid });
-    }
-
-    const initialSid = querySid || (sessList[0] && sessList[0].id);
-    sessList.forEach(s => createTab(s.id, s.id === initialSid));
-
-    if (!activeTabId && tabs.length) {
-      switchTab(tabs[0].id);
-    }
-
+    await refreshSessions();
     updateI18n();
   } catch (e) {
     loadError = true;

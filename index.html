@@ -10,12 +10,25 @@
     html, body { margin: 0; height: 100%; height: 100dvh; background: #1e1e1e; color: #ddd; font-family: system-ui, -apple-system, sans-serif; overflow: hidden; overscroll-behavior: none; }
     body { display: flex; flex-direction: column; }
     #toolbar { display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: #2d2d2d; border-bottom: 1px solid #444; font-size: 13px; }
-    #tabs { display: flex; gap: 4px; align-items: center; flex: 1; overflow-x: auto; -webkit-overflow-scrolling: touch; scroll-behavior: smooth; touch-action: pan-x; padding: 0 4px; }
-    #tabs::-webkit-scrollbar { height: 4px; }
+    [hidden] { display: none !important; }
+    #workspace { display: flex; flex: 1; min-height: 0; min-width: 0; position: relative; }
+    #sidebar { display: flex; flex-direction: column; width: 230px; flex-shrink: 0; min-height: 0; background: #252526; border-right: 1px solid #444; padding: 10px 8px; gap: 10px; }
+    body.sidebar-collapsed #sidebar { display: none; }
+    .sidebar-heading { font-size: 12px; color: #aaa; padding: 0 4px; }
+    #session-groups, .session-actions { display: flex; gap: 4px; }
+    #session-groups button, .session-actions button { flex: 1; min-width: 0; padding: 7px 4px; border: 1px solid #444; border-radius: 4px; background: #333; color: #ddd; cursor: pointer; font-size: 12px; }
+    #session-groups button[aria-selected="true"] { background: #0e639c; border-color: #1177bb; color: #fff; }
+    .session-actions button:disabled { opacity: 0.45; cursor: not-allowed; }
+    #notice { padding: 7px 12px; background: #513c1b; color: #ffe0a3; font-size: 13px; overflow-wrap: anywhere; }
+    #tabs { display: flex; flex-direction: column; gap: 5px; flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; touch-action: pan-y; }
+    #tabs::-webkit-scrollbar { width: 4px; }
     #tabs::-webkit-scrollbar-thumb { background: #555; border-radius: 2px; }
     .tab { display: flex; align-items: center; gap: 6px; padding: 6px 10px; background: #3c3c3c; border-radius: 4px; cursor: pointer; white-space: nowrap; user-select: none; border: 1px solid transparent; min-height: 36px; flex-shrink: 0; }
-    .tab.active { background: #333; color: #fff; border-bottom-color: #55b8f5; box-shadow: inset 0 -2px #55b8f5; }
-    .tab .title { font-family: monospace; font-size: 12px; line-height: 1; white-space: nowrap; min-width: 24px; outline: none; cursor: text; }
+    .tab.active { background: #0e639c; color: #fff; border-color: #1177bb; }
+    .tab .title { flex: 1; overflow: hidden; text-overflow: ellipsis; font-family: monospace; font-size: 12px; line-height: 1.4; white-space: nowrap; min-width: 24px; outline: none; cursor: text; }
+    .backend-badge { font-size: 10px; color: #aaa; border: 1px solid #555; border-radius: 3px; padding: 1px 3px; flex-shrink: 0; }
+    .tab.active .backend-badge { color: #d4ebff; border-color: #5993be; }
+    .app-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; color: #ddd; }
     .tab .title.editing { background: #1e1e1e; color: #d4d4d4; border: 1px solid #1177bb; border-radius: 3px; padding: 1px 4px; }
     .tab .close { display: flex; align-items: center; justify-content: center; font-weight: bold; padding: 0 4px; margin-left: 2px; cursor: pointer; border-radius: 3px; font-size: 14px; min-width: 24px; min-height: 24px; }
     .tab .close:hover { background: #c75450; color: #fff; }
@@ -25,7 +38,7 @@
     .toolbar-btn { padding: 6px 12px; border: none; border-radius: 4px; background: #3c3c3c; color: #ddd; cursor: pointer; font-size: 13px; min-height: 36px; white-space: nowrap; flex-shrink: 0; }
     .toolbar-btn:hover { background: #4c4c4c; }
     .toolbar-btn:disabled { background: #555; color: #999; cursor: not-allowed; }
-    #terminal-area { flex: 1; min-height: 0; position: relative; overflow: hidden; }
+    #terminal-area { flex: 1; min-width: 0; min-height: 0; position: relative; overflow: hidden; }
     .empty-state { display: none; position: absolute; inset: 0; align-items: center; justify-content: center; z-index: 5; }
     .empty-state.visible { display: flex; }
     .empty-state button { font-size: 16px; padding: 10px 20px; }
@@ -69,6 +82,8 @@
 
     @media (max-width: 640px) {
       #toolbar { padding: 4px 6px; gap: 4px; }
+      #sidebar { display: none; position: absolute; top: 0; bottom: 0; left: 0; z-index: 20; width: min(260px, 85vw); box-shadow: 6px 0 20px #0008; }
+      body.sidebar-open #sidebar { display: flex; }
       #tabs { flex: 1 1 auto; min-width: 0; }
       .toolbar-right { margin-left: auto; gap: 4px; flex: 0 0 auto; }
       .toolbar-btn { padding: 5px 8px; font-size: 12px; min-height: 32px; white-space: nowrap; flex-shrink: 0; }
@@ -120,7 +135,8 @@
 <body>
   <script>if (window.matchMedia('(pointer: coarse)').matches) document.body.classList.add('mobile');</script>
   <div id="toolbar">
-    <div id="tabs" role="tablist" aria-label="Terminals"></div>
+    <button id="sidebar-toggle" class="toolbar-btn" onclick="toggleSidebar()" data-i18n="sessions" aria-controls="sidebar" aria-expanded="true">会话</button>
+    <span id="terminal-title" class="app-title" aria-live="polite">Web Terminal</span>
     <div class="toolbar-right">
       <details class="toolbar-menu">
         <summary class="toolbar-btn" aria-label="Session menu">⋯</summary>
@@ -131,9 +147,26 @@
       <button id="settings-btn" class="toolbar-btn" onclick="openSettings()" data-i18n="settings">设置</button>
     </div>
   </div>
-  <div id="terminal-area">
-    <div id="empty-state" class="empty-state">
-      <button class="toolbar-btn" onclick="newTerminal()" data-i18n="newTerminal">新建终端</button>
+  <div id="notice" role="alert" hidden></div>
+  <div id="workspace">
+    <aside id="sidebar" aria-label="Sessions">
+      <div class="sidebar-heading" data-i18n="sessions">会话</div>
+      <div id="session-groups" role="tablist" aria-label="Session groups">
+        <button id="group-pty" role="tab" onclick="setGroup('pty')" aria-controls="tabs" aria-selected="false">PTY</button>
+        <button id="group-tmux" role="tab" onclick="setGroup('tmux')" aria-controls="tabs" aria-selected="false">tmux</button>
+        <button id="group-all" role="tab" onclick="setGroup('all')" aria-controls="tabs" aria-selected="true">All</button>
+      </div>
+      <div class="session-actions">
+        <button id="new-pty-btn" onclick="newTerminal('pty')">+ PTY</button>
+        <button id="new-tmux-btn" onclick="newTerminal('tmux')" disabled>+ tmux</button>
+        <button id="refresh-sessions-btn" onclick="refreshSessions()" data-i18n="refresh">刷新</button>
+      </div>
+      <div id="tabs" role="tablist" aria-label="Terminals"></div>
+    </aside>
+    <div id="terminal-area">
+      <div id="empty-state" class="empty-state">
+        <button class="toolbar-btn" onclick="newTerminal()" data-i18n="newTerminal">新建终端</button>
+      </div>
     </div>
   </div>
 
@@ -143,7 +176,6 @@
     <button id="reconnect-btn" onclick="retryActiveConnection()" hidden></button>
   </div>
   <div id="shortcut-bar"></div>
-  <div id="notice" role="alert" hidden></div>
 
   <div id="settings-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
     <div class="modal-content">

@@ -1,0 +1,14 @@
+[Unit]
+Description=Independent tmux Backend for Web Terminal
+
+[Service]
+Type=simple
+RuntimeDirectory=web-terminal-tmux
+RuntimeDirectoryMode=0700
+ExecStart=/usr/bin/tmux -D -S %t/web-terminal-tmux/default -f "%h/Desktop/web-terminal/.devin/tmux.conf"
+Restart=on-failure
+RestartSec=2
+UnsetEnvironment=TOKEN TMUX TMUX_PANE
+
+[Install]
+WantedBy=default.target

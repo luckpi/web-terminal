@@ -24,10 +24,13 @@ class TerminalBrowserTests(unittest.TestCase):
         cls.url = f'http://127.0.0.1:{port}'
         cls.password = 'review-测试-password'
         cls.log = tempfile.TemporaryFile()
+        cls.backend_directory = tempfile.TemporaryDirectory(prefix='web-terminal-ui-test-')
         cls.server = subprocess.Popen(
             [sys.executable, 'server.py'], cwd=Path(__file__).resolve().parent,
             env={**os.environ, 'HOST': '127.0.0.1', 'PORT': str(port),
-                 'TOKEN': cls.password, 'SHELL': '/bin/bash', 'MAX_SESSIONS': '2'},
+                 'TOKEN': cls.password, 'SHELL': '/bin/bash', 'MAX_SESSIONS': '2',
+                 'TMUX_SOCKET': str(Path(cls.backend_directory.name) / 'managed'),
+                 'TMUX_NATIVE_SOCKET': str(Path(cls.backend_directory.name) / 'native')},
             stdout=cls.log, stderr=cls.log,
         )
         try:
@@ -52,6 +55,7 @@ class TerminalBrowserTests(unittest.TestCase):
             if hasattr(cls, 'playwright'):
                 cls.playwright.stop()
             cls.log.close()
+            cls.backend_directory.cleanup()
             raise
 
     @classmethod
@@ -61,6 +65,7 @@ class TerminalBrowserTests(unittest.TestCase):
         cls.server.terminate()
         cls.server.wait(timeout=10)
         cls.log.close()
+        cls.backend_directory.cleanup()
 
     def setUp(self):
         self.context = self.browser.new_context(
@@ -85,6 +90,9 @@ class TerminalBrowserTests(unittest.TestCase):
     def create_terminal(self):
         self.page.evaluate('newTerminal()')
         self.page.wait_for_function("tabs.find(t => t.id === activeTabId).state === 'connected'")
+
+    def show_sidebar(self):
+        self.page.evaluate("if (getComputedStyle(document.getElementById('sidebar')).display === 'none') toggleSidebar()")
 
     def test_unicode_password_and_session_limit(self):
         self.create_terminal()
@@ -237,6 +245,7 @@ class TerminalBrowserTests(unittest.TestCase):
 
     def test_termination_confirmation_and_failed_delete(self):
         self.create_terminal()
+        self.show_sidebar()
         self.page.once('dialog', lambda dialog: dialog.dismiss())
         self.page.locator('.tab .close').click()
         self.assertEqual(self.page.evaluate('tabs.length'), 1)
@@ -275,6 +284,7 @@ class TerminalBrowserTests(unittest.TestCase):
         self.assertEqual([m['data'] for m in messages['sent']], ['\x1b[1;5D', '\x1b[1;4C', '\x03'])
         self.assertTrue(messages['reset'])
         self.assertFalse(messages['armed'])
+        self.show_sidebar()
         for selector in ['.tab .close', '#shortcut-bar button']:
             bounds = self.page.locator(selector).first.bounding_box()
             self.assertGreaterEqual(bounds['width'], 44)
