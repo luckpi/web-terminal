@@ -323,7 +323,9 @@ function probeConnection(tab, timeout = 10000) {
   if (tab.probeTimer) clearTimeout(tab.probeTimer);
   tab.probeTimer = setTimeout(() => {
     tab.probeTimer = null;
-    if (tab.awaitingPong) reconnectTab(tab);
+    if (tab.awaitingPong && tab.ws && tab.ws.readyState === WebSocket.OPEN && !tab.intentionalClose) {
+      reconnectTab(tab);
+    }
   }, timeout);
 }
 
@@ -598,6 +600,10 @@ function reconnectTab(tab) {
           setConnectionState(tab, msg.type === 'session_closed' ? 'ended' : 'error',
             msg.type === 'error' ? (errors[msg.message] || 'unknownError') : '');
           if (tab.keepaliveTimer) clearInterval(tab.keepaliveTimer);
+          // A probe armed just before the socket ended must not reconnect
+          // later: it would spawn a fresh shell under the ended id.
+          if (tab.probeTimer) { clearTimeout(tab.probeTimer); tab.probeTimer = null; }
+          tab.awaitingPong = false;
           tab.intentionalClose = true;
           if (tab.ws && (tab.ws.readyState === WebSocket.OPEN || tab.ws.readyState === WebSocket.CONNECTING)) {
             tab.ws.close();
@@ -625,6 +631,11 @@ function reconnectTab(tab) {
 
   ws.onclose = () => {
     if (tab.keepaliveTimer) clearInterval(tab.keepaliveTimer);
+    // The socket the probe was watching is gone; whatever happens next is
+    // decided below (intentionalClose stops here, otherwise auto-reconnect
+    // schedules its own attempt).
+    if (tab.probeTimer) { clearTimeout(tab.probeTimer); tab.probeTimer = null; }
+    tab.awaitingPong = false;
     if (tab.intentionalClose || tab.closing) return;
     setConnectionState(tab, 'disconnected');
     if (tab.reconnectTimer) clearTimeout(tab.reconnectTimer);

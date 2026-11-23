@@ -200,6 +200,32 @@ class TerminalBrowserTests(unittest.TestCase):
         self.page.evaluate('window.dead=tabs[0].ws; tabs[0].ws.send=()=>{}; probeConnection(tabs[0], 300)')
         self.page.wait_for_function("tabs[0].ws !== window.dead && tabs[0].state === 'connected'", timeout=5000)
 
+    def test_probe_does_not_resurrect_ended_session(self):
+        self.create_terminal()
+        # A probe armed just before the session ends must not fire after
+        # session_closed: it would spawn a new shell under the ended id.
+        self.page.evaluate("probeConnection(tabs[0], 200); sendToActiveTerminal('exit\\n')")
+        self.page.wait_for_function("tabs[0].state === 'ended'")
+        self.page.wait_for_timeout(400)
+        self.assertFalse(self.page.evaluate('tabs[0].awaitingPong'))
+        self.assertEqual(self.context.request.get(self.url + '/api/sessions').json(), [])
+
+    def test_bfcache_unvisited_tab_reconnects(self):
+        self.create_terminal()
+        # A second tab restored from the session list was never activated,
+        # so it has no socket; a bfcache restore must still let it connect.
+        self.page.evaluate("createTab('restored-sid')")
+        self.page.evaluate('disconnectAllTabs()')
+        self.page.wait_for_timeout(100)
+        self.page.evaluate('''() => {
+          let ev;
+          try { ev = new PageTransitionEvent('pageshow', {persisted: true}); }
+          catch (e) { ev = new Event('pageshow'); Object.defineProperty(ev, 'persisted', {value: true}); }
+          window.dispatchEvent(ev);
+        }''')
+        self.page.evaluate("switchTab('restored-sid')")
+        self.page.wait_for_function("tabs[1].state === 'connected'", timeout=5000)
+
     def test_exit_has_recovery_action(self):
         self.create_terminal()
         self.page.evaluate("sendToActiveTerminal('exit\\n')")
