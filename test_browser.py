@@ -174,6 +174,32 @@ class TerminalBrowserTests(unittest.TestCase):
         }''')
         self.assertEqual(sent, ['ls', '你'])
 
+    def test_resume_recovers_dead_socket_fast(self):
+        self.create_terminal()
+        self.page.evaluate('currentSettings.reconnectInterval=60000; window.dead=tabs[0].ws; tabs[0].ws.close()')
+        self.page.wait_for_function("tabs[0].ws.readyState === WebSocket.CLOSED")
+        self.page.evaluate("window.dispatchEvent(new Event('online'))")
+        self.page.wait_for_function("tabs[0].ws !== window.dead && tabs[0].state === 'connected'", timeout=5000)
+
+    def test_bfcache_pageshow_reconnects(self):
+        self.create_terminal()
+        self.page.evaluate('window.dead=tabs[0].ws; disconnectAllTabs()')
+        self.page.wait_for_timeout(100)
+        self.page.evaluate('''() => {
+          let ev;
+          try { ev = new PageTransitionEvent('pageshow', {persisted: true}); }
+          catch (e) { ev = new Event('pageshow'); Object.defineProperty(ev, 'persisted', {value: true}); }
+          window.dispatchEvent(ev);
+        }''')
+        self.page.wait_for_function("tabs[0].ws !== window.dead && tabs[0].state === 'connected'", timeout=5000)
+
+    def test_probe_reconnects_unanswered_ping(self):
+        self.create_terminal()
+        # A half-open socket: send() succeeds but nothing comes back, so the
+        # pong timeout must force a reconnect instead of waiting for TCP.
+        self.page.evaluate('window.dead=tabs[0].ws; tabs[0].ws.send=()=>{}; probeConnection(tabs[0], 300)')
+        self.page.wait_for_function("tabs[0].ws !== window.dead && tabs[0].state === 'connected'", timeout=5000)
+
     def test_exit_has_recovery_action(self):
         self.create_terminal()
         self.page.evaluate("sendToActiveTerminal('exit\\n')")
