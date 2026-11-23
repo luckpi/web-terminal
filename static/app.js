@@ -303,17 +303,64 @@ function applyTabSize(tab) {
   }
 }
 
+// How long a resume-triggered probe waits for a pong before treating the
+// socket as dead. Half-open sockets (the OS or NAT dropped the connection
+// while the page was backgrounded) otherwise take minutes of TCP
+// retransmission timeouts to detect, which is what makes restoring the
+// terminal feel slow.
+const RESUME_PROBE_MS = 4000;
+
+function probeConnection(tab, timeout = 10000) {
+  if (!tab.ws || tab.ws.readyState !== WebSocket.OPEN) return;
+  if (tab.awaitingPong) {
+    // The previous ping was never answered: the socket is half-open.
+    // Reconnect immediately rather than waiting for TCP to give up.
+    reconnectTab(tab);
+    return;
+  }
+  tab.awaitingPong = true;
+  try { tab.ws.send(JSON.stringify({ type: 'ping' })); } catch (e) {}
+  if (tab.probeTimer) clearTimeout(tab.probeTimer);
+  tab.probeTimer = setTimeout(() => {
+    tab.probeTimer = null;
+    if (tab.awaitingPong && tab.ws && tab.ws.readyState === WebSocket.OPEN && !tab.intentionalClose) {
+      reconnectTab(tab);
+    }
+  }, timeout);
+}
+
 function setupKeepalive(tab) {
   if (tab.keepaliveTimer) clearInterval(tab.keepaliveTimer);
   tab.keepaliveTimer = null;
   if (currentSettings.keepaliveInterval > 0) {
-    tab.keepaliveTimer = setInterval(() => {
-      if (tab.ws && tab.ws.readyState === WebSocket.OPEN) {
-        tab.ws.send(JSON.stringify({ type: 'ping' }));
-      }
-    }, currentSettings.keepaliveInterval);
+    tab.keepaliveTimer = setInterval(() => probeConnection(tab), currentSettings.keepaliveInterval);
   }
 }
+
+// Recover connections when the page returns to the foreground or the
+// network comes back: unpark tabs disconnected by pagehide, and for the
+// active tab either reconnect a dead socket immediately (skipping the
+// reconnect interval) or probe one that claims to be open.
+function recoverConnections() {
+  tabs.forEach(tab => {
+    if (!tab.parked) return;
+    tab.parked = false;
+    tab.intentionalClose = false;
+    tab.ws = null;
+    if (tab.id !== activeTabId) setConnectionState(tab, 'disconnected');
+  });
+  const tab = tabs.find(t => t.id === activeTabId);
+  if (!tab || tab.closing || tab.intentionalClose || tab.state === 'ended') return;
+  if (tab.reconnectTimer) { clearTimeout(tab.reconnectTimer); tab.reconnectTimer = null; }
+  if (!tab.ws || tab.ws.readyState === WebSocket.CLOSING || tab.ws.readyState === WebSocket.CLOSED) {
+    reconnectTab(tab);
+  } else {
+    probeConnection(tab, RESUME_PROBE_MS);
+  }
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) recoverConnections(); });
+window.addEventListener('online', recoverConnections);
+window.addEventListener('pageshow', (e) => { if (e.persisted) recoverConnections(); });
 
 function applyConnectionSettings() {
   tabs.forEach(t => setupKeepalive(t));
@@ -503,6 +550,11 @@ function reconnectTab(tab) {
     clearInterval(tab.keepaliveTimer);
     tab.keepaliveTimer = null;
   }
+  if (tab.probeTimer) {
+    clearTimeout(tab.probeTimer);
+    tab.probeTimer = null;
+  }
+  tab.awaitingPong = false;
   if (tab.ws) {
     try { tab.ws.onclose = null; } catch (e) {}
     try { tab.ws.onerror = null; } catch (e) {}
@@ -533,6 +585,10 @@ function reconnectTab(tab) {
     if (typeof e.data === 'string') {
       try {
         const msg = JSON.parse(e.data);
+        if (msg.type === 'pong') {
+          tab.awaitingPong = false;
+          if (tab.probeTimer) { clearTimeout(tab.probeTimer); tab.probeTimer = null; }
+        }
         if (msg.type === 'session_ready') {
           tab.reconnectAttempts = 0;
           tab.hasConnected = true;
@@ -544,6 +600,10 @@ function reconnectTab(tab) {
           setConnectionState(tab, msg.type === 'session_closed' ? 'ended' : 'error',
             msg.type === 'error' ? (errors[msg.message] || 'unknownError') : '');
           if (tab.keepaliveTimer) clearInterval(tab.keepaliveTimer);
+          // A probe armed just before the socket ended must not reconnect
+          // later: it would spawn a fresh shell under the ended id.
+          if (tab.probeTimer) { clearTimeout(tab.probeTimer); tab.probeTimer = null; }
+          tab.awaitingPong = false;
           tab.intentionalClose = true;
           if (tab.ws && (tab.ws.readyState === WebSocket.OPEN || tab.ws.readyState === WebSocket.CONNECTING)) {
             tab.ws.close();
@@ -571,6 +631,11 @@ function reconnectTab(tab) {
 
   ws.onclose = () => {
     if (tab.keepaliveTimer) clearInterval(tab.keepaliveTimer);
+    // The socket the probe was watching is gone; whatever happens next is
+    // decided below (intentionalClose stops here, otherwise auto-reconnect
+    // schedules its own attempt).
+    if (tab.probeTimer) { clearTimeout(tab.probeTimer); tab.probeTimer = null; }
+    tab.awaitingPong = false;
     if (tab.intentionalClose || tab.closing) return;
     setConnectionState(tab, 'disconnected');
     if (tab.reconnectTimer) clearTimeout(tab.reconnectTimer);
@@ -870,7 +935,7 @@ function createTab(sessionId, active = false) {
   container.className = 'term-container' + (active ? ' active' : '');
   terminalArea.appendChild(container);
 
-  const tab = { state: 'disconnected', reconnectAttempts: 0, id: sessionId, sessionId, tabEl, container, term: null, fitAddon: null, searchAddon: null, searchTerm: '', ws: null, initialSync: true, intentionalClose: false, resizeTimer: null, copyTimer: null, title: getTabTitle(sessionId), cancelInertia: null };
+  const tab = { state: 'disconnected', reconnectAttempts: 0, id: sessionId, sessionId, tabEl, container, term: null, fitAddon: null, searchAddon: null, searchTerm: '', ws: null, initialSync: true, intentionalClose: false, parked: false, awaitingPong: false, probeTimer: null, resizeTimer: null, copyTimer: null, title: getTabTitle(sessionId), cancelInertia: null };
   tabs.push(tab);
 
   titleEl.addEventListener('dblclick', (e) => {
@@ -903,10 +968,13 @@ function switchTab(sessionId) {
   const tab = tabs.find(t => t.id === sessionId);
   if (tab) {
     ensureTerm(tab);
-    if (!tab.ws) {
-      reconnectTab(tab);
+    if (!tab.ws || tab.ws.readyState === WebSocket.CLOSED) {
+      if (!tab.intentionalClose) reconnectTab(tab);
     } else if (tab.ws.readyState === WebSocket.OPEN) {
       applyTabSize(tab);
+      // Switching to a tab is also a good moment to detect a socket that
+      // silently died while it was offscreen.
+      probeConnection(tab, RESUME_PROBE_MS);
     }
     tab.term.focus();
   }
@@ -982,6 +1050,7 @@ async function closeTab(sessionId, confirmed = false) {
   }
   tab.intentionalClose = true;
   if (tab.keepaliveTimer) clearInterval(tab.keepaliveTimer);
+  if (tab.probeTimer) clearTimeout(tab.probeTimer);
   if (tab.resizeTimer) clearTimeout(tab.resizeTimer);
   if (tab.copyTimer) clearTimeout(tab.copyTimer);
   if (tab.ws) tab.ws.close();
@@ -1141,9 +1210,15 @@ function renderShortcutBar() {
 function disconnectAllTabs() {
   // Closing the browser page/tab must NOT kill the backend PTYs.
   tabs.forEach(t => {
+    // Mark live connections as parked so a bfcache restore (pageshow with
+    // persisted=true) knows it must reconnect them — intentionalClose
+    // alone would suppress that. Tabs never activated have no socket yet
+    // and are marked too, or switchTab could never connect them again.
+    if (!t.intentionalClose && (!t.ws || t.ws.readyState <= WebSocket.OPEN)) t.parked = true;
     t.intentionalClose = true;
     if (t.keepaliveTimer) clearInterval(t.keepaliveTimer);
     if (t.reconnectTimer) clearTimeout(t.reconnectTimer);
+    if (t.probeTimer) clearTimeout(t.probeTimer);
     if (t.resizeTimer) clearTimeout(t.resizeTimer);
     if (t.copyTimer) clearTimeout(t.copyTimer);
     if (t.ws) t.ws.close();
