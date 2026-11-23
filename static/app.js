@@ -1212,8 +1212,9 @@ function disconnectAllTabs() {
   tabs.forEach(t => {
     // Mark live connections as parked so a bfcache restore (pageshow with
     // persisted=true) knows it must reconnect them — intentionalClose
-    // alone would suppress that.
-    if (!t.intentionalClose && t.ws && t.ws.readyState <= WebSocket.OPEN) t.parked = true;
+    // alone would suppress that. Tabs never activated have no socket yet
+    // and are marked too, or switchTab could never connect them again.
+    if (!t.intentionalClose && (!t.ws || t.ws.readyState <= WebSocket.OPEN)) t.parked = true;
     t.intentionalClose = true;
     if (t.keepaliveTimer) clearInterval(t.keepaliveTimer);
     if (t.reconnectTimer) clearTimeout(t.reconnectTimer);
